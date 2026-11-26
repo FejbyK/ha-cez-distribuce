@@ -4,8 +4,7 @@
 
 # ČEZ Distribuce pro Home Assistant
 
-Integrace pro **Home Assistant** napojená na portál [ČEZ Distribuce](https://dip.cezdistribuce.cz) a API aplikace [Proud](https://www.cezdistribuce.cz/proud).
-Přináší sledování **HDO**, **odečtů**, **odstávek** a u chytrých elektroměrů **15minutový rozpad spotřeby na VT/NT**, náklady a dlouhodobé statistiky připravené přímo pro **Energy dashboard**.
+**HDO, odečty, odstávky a 15minutový rozpad spotřeby na VT/NT s náklady přímo pro Energy dashboard.**
 
 [![HA Marketplace](https://img.shields.io/badge/HA%20Marketplace-Custom-F05A22?style=for-the-badge&labelColor=1F1F1F)](https://www.home-assistant.io/integrations/marketplace/)
 [![Marketplace Check](https://img.shields.io/github/actions/workflow/status/FejbyK/ha-cez-distribuce/hacs.yaml?branch=main&style=for-the-badge&label=Marketplace%20Check&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/ha-cez-distribuce/actions/workflows/hacs.yaml)
@@ -19,91 +18,87 @@ Přináší sledování **HDO**, **odečtů**, **odstávek** a u chytrých elekt
 
 ---
 
-## Hlavní funkce
+## Co integrace umí
 
-- **Rozdělená spotřeba VT / NT pro Energy dashboard** – stahuje 15minutový profil (`assemblyCode=03`, záložně hodinový `05`), rozděluje ho podle skutečného plánu HDO a zapisuje statistiky spotřeby i nákladů.
-- **Měsíční a denní přehledy** – entity pro aktuální měsíc (spotřeba i náklady celkem / VT / NT, v atributech i minulý měsíc) a za poslední uzavřený kalendářní den.
-- **Stav HDO, ceny a odhady** – aktuální tarif, časy spínání (včetně intervalů přes půlnoc), aktuální cena za kWh a odhad stavu elektroměru (celkem, VT, NT).
-- **Podpora FVE / mikrozdrojů** – samostatná sada entit a statistika dodávky do sítě (`assemblyCode=06`) bez zbytečných HDO senzorů.
-- **Více odběrných míst a prostředí** – podpora více EAN i účtů kombinujících prostředí **Domácnost** a **Podnikatel**.
-- **Šetrný provoz a samostatná doména** – doména `cez_distribuce` (lze provozovat i souběžně s jinými ČEZ integracemi), sdílená HTTP spojení, 4h interval dotazů po doručení včerejška a přeskakování neměnných zápisů do Recorderu.
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>⚡ 15min rozpad VT / NT</strong><br />
+      Stahuje čtvrthodinový profil z chytrého elektroměru, dělí ho podle skutečného HDO a zapisuje statistiky do <strong>Energy dashboardu</strong>.
+    </td>
+    <td width="50%" valign="top">
+      <strong>💰 Měsíční a denní náklady</strong><br />
+      Přehled spotřeby i ceny za aktuální a minulý měsíc i poslední uzavřený den (celkem, VT, NT).
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>🕒 HDO, tarify a odhady</strong><br />
+      Aktuální tarif, časy spínání (i přes půlnoc), aktuální cena za kWh a odhad stavu elektroměru.
+    </td>
+    <td width="50%" valign="top">
+      <strong>☀️ FVE a mikrozdroje</strong><br />
+      Samostatná statistika dodávky do sítě bez zbytečných HDO senzorů. U jednotarifu se HDO entity skryjí automaticky.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>🏠 Více EAN i prostředí</strong><br />
+      Podpora více odběrných míst i účtů kombinujících <strong>Domácnost</strong> a <strong>Podnikatel</strong>.
+    </td>
+    <td width="50%" valign="top">
+      <strong>🚀 Šetrný provoz</strong><br />
+      Samostatná doména <code>cez_distribuce</code>, sdílená spojení, 4h dotazy po doručení včerejška a žádné zbytečné zápisy do Recorderu.
+    </td>
+  </tr>
+</table>
 
----
-
-## Instalace
-
-1. Klikněte na tlačítko **Otevřít repozitář v Marketplace** výše – nebo v Home Assistantu otevřete **Nastavení → Marketplace → Přidat z odkazu** a vložte `https://github.com/FejbyK/ha-cez-distribuce` (vlastní repozitář vyžaduje propojený GitHub účet).
-2. Nainstalujte **ČEZ Distribuce** (u starších verzí HA restartujte Home Assistant).
-3. Přidejte integraci v **Nastavení → Zařízení a služby → Přidat integraci → ČEZ Distribuce**.
+### Jak to vypadá v Home Assistantu
 
 
----
+<details>
 
-## Nastavení
-
-Integrace používá přihlašovací údaje k portálu [dip.cezdistribuce.cz](https://dip.cezdistribuce.cz/) (přihlášení přes Google/Apple není podporováno).
-
-- **Více odběrných míst**: každé OM (EAN) je samostatná položka integrace – přidejte ji opakovaně přes **Přidat položku**.
-- **Domácnost + Podnikatel**: průvodce automaticky projde všechna prostředí portálu a uloží správné prostředí k vybranému EAN.
-- **Změna cen VT/NT nebo HDO signálu**: kdykoliv přes **Nastavení → Zařízení a služby → ČEZ Distribuce → Konfigurovat** (po uložení se integrace sama načte znovu).
-- **Změna přihlašovacích údajů**: přes **⋮ → Překonfigurovat** (při změně hesla vyzve HA k re-autorizaci automaticky).
-
----
-
-## Dostupné entity
-
-### Spotřeba a náklady (chytrý elektroměr)
-
-| Entita | Jednotka | Popis |
-| --- | --- | --- |
-| `sensor.celkova_mesicni_spotreba` | kWh | Spotřeba za aktuální měsíc (v atributech VT/NT, náklady a minulý měsíc) |
-| `sensor.mesicni_vt_spotreba` / `sensor.mesicni_nt_spotreba` | kWh | Měsíční spotřeba VT / NT |
-| `sensor.celkove_mesicni_naklady` | CZK* | Náklady za aktuální měsíc (součet VT + NT) |
-| `sensor.mesicni_naklady_vt` / `sensor.mesicni_naklady_nt` | CZK* | Měsíční náklady VT / NT |
-| `sensor.posledni_den_spotreba` | kWh | Spotřeba za poslední uzavřený kalendářní den (typicky včerejšek) |
-| `sensor.posledni_den_vt_spotreba` / `sensor.posledni_den_nt_spotreba` | kWh | Spotřeba VT / NT za poslední uzavřený den |
-
-*\* Používá měnu nastavenou v Home Assistantu.*
-
-### Odečty, odhady, HDO a diagnostika
-
-| Entita | Jednotka / typ | Popis |
-| --- | --- | --- |
-| `sensor.spotreba_vt` / `sensor.spotreba_nt` / `sensor.celkova_spotreba` | kWh | Poslední odečet z portálu (VT, NT, součet) |
-| `sensor.odhadovany_stav_elektromeru` (`_vt`, `_nt`) | kWh | Poslední odečet + hodinová spotřeba od data odečtu |
-| `sensor.aktualni_cena` | Kč/kWh | Aktuální cena podle stavu HDO (u jednotarifu přímo cena VT) |
-| `sensor.stav_hdo` / `sensor.spinani_hdo_dnes` | Stav / počet | Aktuální tarif (**VT** / **NT**) a dnešní NT intervaly v atributech |
-| `sensor.vysoky_tarif_start` / `_konec`, `sensor.nizky_tarif_start` / `_konec` | Čas | Začátek a konec aktuálního / nejbližšího VT a NT bloku |
-| `sensor.odpocet_do_konce_vysokeho_tarifu` / `_nizkeho_tarifu` | min | Odpočet do konce tarifního bloku (ve výchozím stavu skryté) |
-| `binary_sensor.porucha_odstavka` | Binární | Hlášená porucha nebo plánovaná odstávka |
-| `sensor.posledni_uspesna_aktualizace` / `sensor.hodinova_data_spotreby_k` | Diagnostika | Čas posledního stažení a konec poslední importované hodiny |
-
-> [!NOTE]
-> U potvrzeně **jednotarifních odběrných míst** (portál nevrací žádné HDO signály) se zbytečné HDO entity nevytvářejí. U **výroby / FVE** (`typ` `V`, `M`, `B`) se vytváří pouze `sensor.celkova_dodavka_do_site`, `binary_sensor.porucha_odstavka` a diagnostické senzory.
+</details>
 
 ---
 
-## Energy dashboard a dlouhodobé statistiky
+## Rychlá instalace
 
-> [!IMPORTANT]
-> Hodinová/15min data vyžadují chytrý elektroměr a využívají neoficiální API aplikace **Proud** (MEPAS). U elektroměrů bez dálkového odečtu se tato část tiše přeskočí a ostatní entity fungují beze změny.
+1. Klikněte na tlačítko **Otevřít repozitář v Marketplace** nahoře *(nebo v HA: **Nastavení → Marketplace → Přidat z odkazu** → `https://github.com/FejbyK/ha-cez-distribuce`; vlastní repozitář vyžaduje propojený GitHub účet)*.
+2. Nainstalujte **ČEZ Distribuce** *(u starších verzí HA restartujte Home Assistant)*.
+3. Přidejte integraci v **Nastavení → Zařízení a služby → Přidat integraci → ČEZ Distribuce** a přihlaste se účtem z [dip.cezdistribuce.cz](https://dip.cezdistribuce.cz/).
 
-Integrace vytváří externí dlouhodobé statistiky (přesné ID najdete v atributu `statistiky` entity `sensor.hodinova_data_spotreby_k`):
+<details>
+<summary>Ruční instalace a tipy k nastavení</summary>
 
-| Statistika | Jednotka | Použití v Energy dashboardu |
-| --- | --- | --- |
-| `cez_distribuce:<ean>_consumption_vt` | kWh | **Spotřeba ze sítě** – vysoký tarif (+ náklady `…_cost_vt`) |
-| `cez_distribuce:<ean>_consumption_nt` | kWh | **Spotřeba ze sítě** – nízký tarif (+ náklady `…_cost_nt`) |
-| `cez_distribuce:<ean>_consumption` | kWh | **Spotřeba ze sítě** – alternativa bez dělení tarifů (+ `…_cost_total`) |
-| `cez_distribuce:<ean>_cost_vt` / `_nt` / `_total` | měna HA | Volitelné statistiky nákladů podle cen z konfigurace |
-| `cez_distribuce:<ean>_production` | kWh | **Vrácení do sítě** (jen u výrobních / FVE EAN) |
+- **Ruční instalace**: zkopírujte složku `custom_components/cez_distribuce` do `config/custom_components/` a restartujte Home Assistant.
+- **Přihlášení**: funguje e-mail a heslo portálu [dip.cezdistribuce.cz](https://dip.cezdistribuce.cz/) (přihlášení přes Google/Apple není podporováno).
+- **Více odběrných míst**: každé OM (EAN) přidejte jako další položku přes **Přidat položku**.
+- **Změna cen VT/NT nebo HDO signálu**: kdykoliv přes **Konfigurovat** u dané položky (integrace se sama znovu načte).
+- **Změna hesla**: přes **⋮ → Překonfigurovat** (nebo automaticky při výzvě k re-autorizaci).
+
+</details>
+
+---
+
+## Napojení na Energy dashboard
 
 > [!TIP]
-> Do Energy dashboardu přidejte buď dvojici `consumption_vt` + `consumption_nt`, **nebo** pouze `consumption` – nikdy obojí najednou, jinak se spotřeba započítá dvakrát. ČEZ data publikuje zpětně kolem 1:00 v noci za celý předchozí den.
+> Přidejte do Energy dashboardu buď dvojici `consumption_vt` + `consumption_nt`, **nebo** jen `consumption` – nikdy obojí najednou. ČEZ data publikuje zpětně kolem 1:00 v noci za předchozí den.
 
-### Přepočet historických statistik
+| Statistika | Jednotka | Kam přidat |
+| --- | --- | --- |
+| `cez_distribuce:<ean>_consumption_vt` | kWh | **Spotřeba ze sítě** – VT *(+ náklady `…_cost_vt`)* |
+| `cez_distribuce:<ean>_consumption_nt` | kWh | **Spotřeba ze sítě** – NT *(+ náklady `…_cost_nt`)* |
+| `cez_distribuce:<ean>_consumption` | kWh | **Spotřeba ze sítě** – bez dělení tarifů *(+ `…_cost_total`)* |
+| `cez_distribuce:<ean>_production` | kWh | **Vrácení do sítě** *(jen u FVE / výroby)* |
 
-Po změně cen elektřiny nebo HDO signálu můžete zpětně přepočítat statistiky v **Nástroje pro vývojáře → Akce**:
+*(Přesná ID najdete v atributu `statistiky` entity `sensor.hodinova_data_spotreby_k`. Hodinová/15min data vyžadují chytrý elektroměr s dálkovým odečtem.)*
+
+<details>
+<summary>🔄 Zpětný přepočet statistik po změně cen nebo HDO signálu</summary>
+
+V **Nástroje pro vývojáře → Akce** spusťte:
 
 ```yaml
 action: cez_distribuce.recalculate_statistics
@@ -114,60 +109,74 @@ data:
 ```
 
 - `days` (`1`–`1095`, výchozí `30`) – počet dní zpět.
-- `recalculate_costs_only: true` – rychle přepočítá jen náklady z uložených statistik VT/NT bez volání ČEZ API.
-- `recalculate_costs_only: false` – znovu stáhne 15min profil z MEPAS a přepočítá VT/NT i náklady.
-
----
-
-## Ukázky
-
-<details>
-<summary>Zobrazit náhledy grafů v Home Assistantu</summary>
-
-### Spotřeba
-<img width="1615" height="485" alt="Graf spotřeby v Home Assistantu" src="https://github.com/user-attachments/assets/3642cec5-063c-4aa2-a0e4-c6796b6320fa" />
-
-### Přetoky a výroba (FVE)
-<img width="1455" height="914" alt="Graf přetoků a výroby v Home Assistantu" src="https://github.com/user-attachments/assets/8a5e63be-1f50-4ab0-98f9-30f6acd0f104" />
+- `recalculate_costs_only: true` – rychlý přepočet jen nákladů bez volání ČEZ API.
+- `recalculate_costs_only: false` – znovu stáhne 15min profil a přepočítá VT/NT i náklady.
 
 </details>
 
 ---
 
-## Aktualizace a řešení problémů
-
-- **Portálová data** (HDO, odečty, odstávky) se obnovují každou hodinu.
-- **MEPAS / hodinová data** se po doručení včerejška (obvykle mezi 1:00–2:00) dotazují jen každé 4 hodiny a neměnná data se do Recorderu nezapisují. Jednou denně probíhá kontrola a doplnění případných děr za posledních 62 dní.
-- **Přesnost rozpadu VT/NT**: integrace si ukládá denní plány HDO až 400 dní zpět a u 15min profilu počítá přesný poměr minut NT/VT v každé čtvrthodině (včetně přechodů přes půlnoc i změny letního/zimního času).
+## Přehled entit
 
 <details>
-<summary>Nejčastější chyby a diagnostika</summary>
+<summary>📊 Zobrazit kompletní seznam vytvářených senzorů</summary>
+
+### Spotřeba a náklady (chytrý elektroměr)
+
+| Entita | Jednotka | Popis |
+| --- | --- | --- |
+| `sensor.celkova_mesicni_spotreba` | kWh | Spotřeba za aktuální měsíc *(v atributech VT/NT, náklady a minulý měsíc)* |
+| `sensor.mesicni_vt_spotreba` / `sensor.mesicni_nt_spotreba` | kWh | Měsíční spotřeba VT / NT |
+| `sensor.celkove_mesicni_naklady` | měna HA | Náklady za aktuální měsíc (VT + NT) |
+| `sensor.mesicni_naklady_vt` / `sensor.mesicni_naklady_nt` | měna HA | Měsíční náklady VT / NT |
+| `sensor.posledni_den_spotreba` | kWh | Spotřeba za poslední uzavřený kalendářní den |
+| `sensor.posledni_den_vt_spotreba` / `sensor.posledni_den_nt_spotreba` | kWh | Spotřeba VT / NT za poslední uzavřený den |
+
+### Odečty, odhady, HDO a diagnostika
+
+| Entita | Typ / jednotka | Popis |
+| --- | --- | --- |
+| `sensor.spotreba_vt` / `sensor.spotreba_nt` / `sensor.celkova_spotreba` | kWh | Poslední odečet z portálu |
+| `sensor.odhadovany_stav_elektromeru` (`_vt`, `_nt`) | kWh | Odečet + hodinová spotřeba od data odečtu |
+| `sensor.aktualni_cena` | Kč/kWh | Aktuální cena podle stavu HDO *(u jednotarifu cena VT)* |
+| `sensor.stav_hdo` / `sensor.spinani_hdo_dnes` | Stav / počet | Aktuální tarif (**VT** / **NT**) a dnešní NT bloky v atributech |
+| `binary_sensor.nizky_tarif` / `binary_sensor.vysoky_tarif` | Binární | Aktivní nízký tarif (NT) a opačný indikátor vysokého tarifu (VT) |
+| `sensor.vysoky_tarif_start` / `_konec`, `sensor.nizky_tarif_start` / `_konec` | Čas | Začátek a konec aktuálního / nejbližšího VT a NT bloku |
+| `sensor.odpocet_do_konce_vysokeho_tarifu` / `_nizkeho_tarifu` | min | Odpočet do konce bloku *(ve výchozím stavu skryté)* |
+| `binary_sensor.porucha_odstavka` | Binární | Hlášená porucha nebo plánovaná odstávka |
+| `sensor.posledni_uspesna_aktualizace` / `sensor.hodinova_data_spotreby_k` | Diagnostika | Čas posledního stažení a konec poslední importované hodiny |
+
+> [!NOTE]
+> U potvrzeně **jednotarifních OM** se HDO entity nevytvářejí. U **FVE / výroby** (`typ` `V`, `M`, `B`) se vytváří pouze `sensor.celkova_dodavka_do_site`, `binary_sensor.porucha_odstavka` a diagnostika.
+
+</details>
+
+<details>
+<summary>🛠️ Řešení problémů, intervaly a diagnostika</summary>
+
+- **Intervaly**: portál (HDO, odečty, odstávky) každou hodinu; MEPAS po doručení včerejška každé 4 hodiny + denní kontrola děr za 62 dní.
+- **Historie HDO**: integrace ukládá denní plány až 400 dní zpět a počítá přesný poměr minut NT/VT v každé čtvrthodině (včetně DST).
 
 | Problém | Řešení |
 | --- | --- |
-| **Nesprávné přihlašovací údaje** | Ověřte e-mail a heslo na [dip.cezdistribuce.cz](https://dip.cezdistribuce.cz/). |
-| **Portál vyžaduje akci** | Přihlaste se jednou v prohlížeči na [dip.cezdistribuce.cz](https://dip.cezdistribuce.cz/) a potvrďte podmínky/smlouvu. |
-| **Žádná odběrná místa** | Účet Můj ČEZ nestačí – OM musí být přiřazené v portálu ČEZ Distribuce (ne PRE ani EG.D). |
-| **Portál dočasně nedostupný** | Běžné při noční údržbě – integrace podrží poslední data a zkusí to za hodinu znovu. |
+| **Nesprávné přihlášení** | Ověřte e-mail a heslo na [dip.cezdistribuce.cz](https://dip.cezdistribuce.cz/). |
+| **Portál vyžaduje akci** | Přihlaste se jednou v prohlížeči a potvrďte podmínky/smlouvu. |
+| **Žádná odběrná místa** | Účet Můj ČEZ nestačí – OM musí být v portálu ČEZ Distribuce (ne PRE/EG.D). |
+| **Portál nedostupný** | Běžná noční údržba – integrace podrží poslední data a zkusí to znovu za hodinu. |
 | **Statistika se neposouvá** | Zkontrolujte `sensor.hodinova_data_spotreby_k` a zapněte debug log níže. |
 
-**Debug logování** (`configuration.yaml`):
-
 ```yaml
+# configuration.yaml – debug logování
 logger:
   logs:
     custom_components.cez_distribuce: debug
 ```
 
-**Ruční ověření bez Home Assistantu** (vyžaduje `pip install aiohttp beautifulsoup4`):
-
 ```bash
+# Ruční ověření bez HA (pip install aiohttp beautifulsoup4)
 CEZ_USER='email' CEZ_PASS='heslo' python3 scripts/test_pnd_consumption.py
-```
 
-**Spuštění testů**:
-
-```bash
+# Spuštění unit testů
 python3 -m unittest discover -s tests -v
 ```
 
@@ -177,6 +186,6 @@ python3 -m unittest discover -s tests -v
 
 ## Licence a poděkování
 
-- Integrace využívá neoficiální API portálu ČEZ Distribuce a aplikace Proud – struktura odpovědí se může bez upozornění změnit.
-- Vychází z projektu [MattXcz/CEZ](https://github.com/MattXcz/CEZ), rozpad spotřeby na VT/NT a nákladové statistiky jsou inspirovány [igracek/HACS_CEZD_PND](https://github.com/igracek/HACS_CEZD_PND), za původní reverzní analýzu aplikace Proud patří poděkování Romanu Vohradníkovi.
+- Neoficiální integrace využívající portál [ČEZ Distribuce](https://dip.cezdistribuce.cz) a API aplikace [Proud](https://www.cezdistribuce.cz/proud).
+- Vychází z [MattXcz/CEZ](https://github.com/MattXcz/CEZ), rozpad VT/NT a náklady inspirovány [igracek/HACS_CEZD_PND](https://github.com/igracek/HACS_CEZD_PND), za analýzu aplikace Proud díky Romanu Vohradníkovi.
 - Šířeno pod licencí [GNU GPL-3.0](LICENSE) (původní MIT oznámení viz [NOTICE](NOTICE)).

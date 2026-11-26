@@ -292,6 +292,30 @@ def _install_stubs() -> dict[str, Any]:
     ha_sensor.SensorEntity = _SensorEntity
     _put("homeassistant.components.sensor", ha_sensor)
 
+    # Binary sensor stubs
+    ha_bsensor = types.ModuleType("homeassistant.components.binary_sensor")
+    ha_bsensor.BinarySensorDeviceClass = types.SimpleNamespace(PROBLEM="problem")
+
+    class _BinarySensorEntity:
+        @property
+        def name(self):
+            return getattr(self, "_attr_name", None)
+
+        @property
+        def unique_id(self):
+            return getattr(self, "_attr_unique_id", None)
+
+        @property
+        def device_class(self):
+            return getattr(self, "_attr_device_class", None)
+
+        @property
+        def icon(self):
+            return getattr(self, "_attr_icon", None)
+
+    ha_bsensor.BinarySensorEntity = _BinarySensorEntity
+    _put("homeassistant.components.binary_sensor", ha_bsensor)
+
     # Helpers stubs
     ha_helpers = types.ModuleType("homeassistant.helpers")
     _put("homeassistant.helpers", ha_helpers)
@@ -423,6 +447,7 @@ class TestCoordinatorAndSensors(unittest.IsolatedAsyncioTestCase):
         cls.cez_flow = importlib.import_module("custom_components.cez_distribuce.config_flow")
         cls.cez_coord = importlib.import_module("custom_components.cez_distribuce.coordinator")
         cls.cez_sensor = importlib.import_module("custom_components.cez_distribuce.sensor")
+        cls.cez_bsensor = importlib.import_module("custom_components.cez_distribuce.binary_sensor")
         cls.dt_util = sys.modules["homeassistant.util.dt"]
 
     @classmethod
@@ -708,6 +733,84 @@ class TestCoordinatorAndSensors(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(saved["data"][self.cez_const.CONF_HDO_SIGNAL], "b2c3dp02")
         self.assertEqual(saved["data"][self.cez_const.CONF_PRICE_VT], 6.0)
         self.assertEqual(saved["data"][self.cez_const.CONF_PRICE_NT], 3.0)
+
+    async def test_tariff_binary_sensors_invert_and_respect_single_tariff_and_production(self) -> None:
+        recorder = _FakeRecorder()
+        hass = _FakeHass(recorder)
+        ean = "859182400100000055"
+        entry = _FakeEntry(
+            entry_id="entry-dual",
+            data={
+                self.cez_const.CONF_EAN: ean,
+                self.cez_const.CONF_HDO_SIGNAL: "a3b7dp01",
+            },
+        )
+        coordinator = self.cez_coord.CezDistribuceCoordinator(
+            hass, _FakeApiClient([]), ean=ean, uid="u", hdo_signal="a3b7dp01"
+        )
+        coordinator.data = {
+            self.cez_const.DATA_SIGNALS: {
+                "signals": [
+                    {"signal": "a3b7dp01", "datum": "15.04.2026", "casy": "00:00-06:00;22:00-24:00"},
+                ]
+            }
+        }
+        hass.data[self.cez_const.DOMAIN] = {entry.entry_id: coordinator}
+
+        added: list[Any] = []
+        await self.cez_bsensor.async_setup_entry(hass, entry, added.extend)
+        self.assertEqual(len(added), 3)
+        nt_bin = next(ent for ent in added if ent.unique_id == f"{ean}_low_tariff")
+        vt_bin = next(ent for ent in added if ent.unique_id == f"{ean}_high_tariff")
+        self.assertEqual(nt_bin.name, "Nízký tarif")
+        self.assertEqual(vt_bin.name, "Vysoký tarif")
+
+        # Inside NT window (03:00 Prague) -> NT=True, VT=False
+        self.dt_util._now_override = datetime(2026, 4, 15, 3, 0, tzinfo=PRAGUE)
+        self.assertTrue(nt_bin.is_on)
+        self.assertFalse(vt_bin.is_on)
+        self.assertEqual(nt_bin.extra_state_attributes["stav_hdo"], "NT")
+        self.assertEqual(vt_bin.extra_state_attributes["stav_hdo"], "NT")
+
+        # Inside VT window (12:00 Prague) -> NT=False, VT=True
+        self.dt_util._now_override = datetime(2026, 4, 15, 12, 0, tzinfo=PRAGUE)
+        self.assertFalse(nt_bin.is_on)
+        self.assertTrue(vt_bin.is_on)
+        self.assertEqual(nt_bin.extra_state_attributes["stav_hdo"], "VT")
+        self.assertEqual(vt_bin.extra_state_attributes["stav_hdo"], "VT")
+
+        # Missing HDO data -> both unknown (None)
+        coordinator.data = {}
+        self.assertIsNone(nt_bin.is_on)
+        self.assertIsNone(vt_bin.is_on)
+
+        # Single-tariff OM -> only outage binary sensor
+        entry_single = _FakeEntry(
+            entry_id="entry-single-bin",
+            data={self.cez_const.CONF_EAN: ean, self.cez_const.CONF_HDO_SIGNAL: ""},
+        )
+        coord_single = self.cez_coord.CezDistribuceCoordinator(
+            hass, _FakeApiClient([]), ean=ean, uid="u", hdo_signal=""
+        )
+        coord_single.data = {self.cez_const.DATA_SIGNALS: {"signals": []}}
+        hass.data[self.cez_const.DOMAIN][entry_single.entry_id] = coord_single
+        added_single: list[Any] = []
+        await self.cez_bsensor.async_setup_entry(hass, entry_single, added_single.extend)
+        self.assertEqual([type(e) for e in added_single], [self.cez_bsensor.CezOutageSensor])
+
+        # Production / FVE OM -> only outage binary sensor
+        entry_prod = _FakeEntry(
+            entry_id="entry-prod-bin",
+            data={
+                self.cez_const.CONF_EAN: ean,
+                self.cez_const.CONF_OM_TYPE: "V",
+                self.cez_const.CONF_HDO_SIGNAL: "a3b7dp01",
+            },
+        )
+        hass.data[self.cez_const.DOMAIN][entry_prod.entry_id] = coordinator
+        added_prod: list[Any] = []
+        await self.cez_bsensor.async_setup_entry(hass, entry_prod, added_prod.extend)
+        self.assertEqual([type(e) for e in added_prod], [self.cez_bsensor.CezOutageSensor])
 
 
 if __name__ == "__main__":

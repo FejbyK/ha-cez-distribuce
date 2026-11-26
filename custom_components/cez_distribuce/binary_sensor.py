@@ -1,7 +1,8 @@
-"""Binary senzory pro ČEZ – poruchy a odstávky."""
+"""Binary senzory pro ČEZ – poruchy/odstávky a stav tarifů HDO (NT/VT)."""
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.binary_sensor import (
@@ -9,13 +10,35 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntity,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_EAN, DATA_OUTAGES, DOMAIN
+from .const import (
+    CONF_EAN,
+    CONF_HDO_SIGNAL,
+    CONF_OM_TYPE,
+    DATA_OUTAGES,
+    DATA_SIGNALS,
+    DOMAIN,
+    HDO_STATE_NT,
+    HDO_STATE_UNKNOWN,
+    HDO_STATE_VT,
+    OM_TYPE_CONSUMPTION,
+    OM_TYPES_PRODUCTION,
+)
 from .coordinator import CezDistribuceCoordinator
+from .sensor import (
+    _current_hdo_state_from_windows,
+    _current_tariff_window_absolute,
+    _get_nt_windows_around_now,
+    _get_todays_intervals,
+    _local_iso,
+    _local_now,
+    _next_tariff_window_absolute,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,9 +48,37 @@ async def async_setup_entry(
     entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
+    """Nastaví binární senzory z config entry."""
     coordinator: CezDistribuceCoordinator = hass.data[DOMAIN][entry.entry_id]
     ean = entry.data[CONF_EAN]
-    async_add_entities([CezOutageSensor(coordinator, entry, ean)])
+    hdo_signal = entry.options.get(
+        CONF_HDO_SIGNAL, entry.data.get(CONF_HDO_SIGNAL, "")
+    )
+    om_type = entry.data.get(CONF_OM_TYPE) or OM_TYPE_CONSUMPTION
+    is_production = om_type in OM_TYPES_PRODUCTION
+
+    entities: list[BinarySensorEntity] = [CezOutageSensor(coordinator, entry, ean)]
+
+    if not is_production:
+        signals_data = (coordinator.data or {}).get(DATA_SIGNALS)
+        is_single_tariff = (
+            not hdo_signal
+            and isinstance(signals_data, dict)
+            and not (signals_data.get("signals") or [])
+        )
+        if not is_single_tariff:
+            entities.extend(
+                [
+                    CezTariffBinarySensor(
+                        coordinator, entry, ean, hdo_signal, HDO_STATE_NT
+                    ),
+                    CezTariffBinarySensor(
+                        coordinator, entry, ean, hdo_signal, HDO_STATE_VT
+                    ),
+                ]
+            )
+
+    async_add_entities(entities)
 
 
 class CezOutageSensor(CoordinatorEntity[CezDistribuceCoordinator], BinarySensorEntity):
@@ -72,4 +123,94 @@ class CezOutageSensor(CoordinatorEntity[CezDistribuceCoordinator], BinarySensorE
         return {
             "poruchy_odstavky": outage_list,
             "pocet": len(outage_list),
+        }
+
+
+class CezTariffBinarySensor(
+    CoordinatorEntity[CezDistribuceCoordinator], BinarySensorEntity
+):
+    """Binární indikátor aktivního tarifu HDO (Nízký tarif / Vysoký tarif)."""
+
+    _attr_has_entity_name = True
+    _unsub_time_listener: CALLBACK_TYPE | None = None
+
+    def __init__(
+        self,
+        coordinator: CezDistribuceCoordinator,
+        entry: ConfigEntry,
+        ean: str,
+        hdo_signal: str,
+        tariff: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._ean = ean
+        self._hdo_signal = hdo_signal
+        self._tariff = tariff
+
+        if tariff == HDO_STATE_NT:
+            self._attr_unique_id = f"{ean}_low_tariff"
+            self._attr_name = "Nízký tarif"
+            self._attr_icon = "mdi:flash-outline"
+        else:
+            self._attr_unique_id = f"{ean}_high_tariff"
+            self._attr_name = "Vysoký tarif"
+            self._attr_icon = "mdi:flash"
+
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, ean)},
+            name=entry.title,
+            manufacturer="ČEZ",
+            model="Elektroměr",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Po přidání do HA spustí minutový přepočet stavu."""
+        await super().async_added_to_hass()
+        self._unsub_time_listener = async_track_time_interval(
+            self.hass, self._handle_time_change, timedelta(minutes=1)
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        """Uklidí minutový listener při odebrání entity."""
+        if self._unsub_time_listener is not None:
+            self._unsub_time_listener()
+            self._unsub_time_listener = None
+        await super().async_will_remove_from_hass()
+
+    @callback
+    def _handle_time_change(self, _: datetime) -> None:
+        """Zapíše aktuální stav při minutovém tiknutí."""
+        self.async_write_ha_state()
+
+    @property
+    def is_on(self) -> bool | None:
+        """True pokud je právě aktivní sledovaný tarif (NT nebo VT)."""
+        windows = _get_nt_windows_around_now(self.coordinator.data, self._hdo_signal)
+        if windows is None:
+            return None
+        return _current_hdo_state_from_windows(windows) == self._tariff
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        windows = _get_nt_windows_around_now(self.coordinator.data, self._hdo_signal)
+        hdo_state = (
+            _current_hdo_state_from_windows(windows)
+            if windows is not None
+            else HDO_STATE_UNKNOWN
+        )
+        now = _local_now()
+        intervals = _get_todays_intervals(self.coordinator.data, self._hdo_signal) or []
+        current_window = (
+            _current_tariff_window_absolute(intervals, hdo_state, now)
+            if hdo_state in (HDO_STATE_NT, HDO_STATE_VT)
+            else None
+        )
+        next_window = _next_tariff_window_absolute(intervals, self._tariff, now)
+        return {
+            "hdo_signal": self._hdo_signal,
+            "tarif": self._tariff,
+            "stav_hdo": hdo_state,
+            "od": _local_iso(current_window[0]) if current_window else None,
+            "do": _local_iso(current_window[1]) if current_window else None,
+            "dalsi_sepnuti": _local_iso(next_window[0]) if next_window else None,
         }
