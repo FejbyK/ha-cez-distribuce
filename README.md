@@ -7,13 +7,13 @@
 Integrace pro **Home Assistant** napojená na portál [ČEZ Distribuce](https://dip.cezdistribuce.cz) a API aplikace [Proud](https://www.cezdistribuce.cz/proud).
 Přináší sledování **HDO**, **odečtů**, **odstávek** a u chytrých elektroměrů **15minutový rozpad spotřeby na VT/NT**, náklady a dlouhodobé statistiky připravené přímo pro **Energy dashboard**.
 
-[![HACS Custom](https://img.shields.io/badge/HACS-Custom-F05A22?style=for-the-badge&labelColor=1F1F1F&logoColor=F05A22)](https://github.com/hacs/integration)
-[![HACS Validation](https://img.shields.io/github/actions/workflow/status/FejbyK/ha-cez-distribuce/hacs.yaml?branch=main&style=for-the-badge&label=HACS%20Check&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/ha-cez-distribuce/actions/workflows/hacs.yaml)
+[![HA Marketplace](https://img.shields.io/badge/HA%20Marketplace-Custom-F05A22?style=for-the-badge&labelColor=1F1F1F)](https://www.home-assistant.io/integrations/marketplace/)
+[![Marketplace Check](https://img.shields.io/github/actions/workflow/status/FejbyK/ha-cez-distribuce/hacs.yaml?branch=main&style=for-the-badge&label=Marketplace%20Check&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/ha-cez-distribuce/actions/workflows/hacs.yaml)
 [![Code Quality](https://img.shields.io/github/actions/workflow/status/FejbyK/ha-cez-distribuce/quality.yaml?branch=main&style=for-the-badge&label=Tests%20%26%20Quality&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/ha-cez-distribuce/actions/workflows/quality.yaml)
 [![Hassfest](https://img.shields.io/github/actions/workflow/status/FejbyK/ha-cez-distribuce/hassfest.yaml?branch=main&style=for-the-badge&label=Hassfest&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/ha-cez-distribuce/actions/workflows/hassfest.yaml)
 [![Licence GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-F05A22?style=for-the-badge&labelColor=1F1F1F)](LICENSE)
 
-[![Otevřít repozitář v HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?category=Integration&owner=FejbyK&repository=ha-cez-distribuce)
+[![Otevřít repozitář v Marketplace](https://my.home-assistant.io/badges/marketplace_repository.svg)](https://my.home-assistant.io/redirect/marketplace_repository/?owner=FejbyK&repository=ha-cez-distribuce&category=integration)
 
 </div>
 
@@ -32,16 +32,10 @@ Přináší sledování **HDO**, **odečtů**, **odstávek** a u chytrých elekt
 
 ## Instalace
 
-### Přes HACS (doporučeno)
-
-1. Klikněte na tlačítko **Otevřít repozitář v HACS** výše (nebo **HACS → ⋮ → Vlastní repozitáře** → `https://github.com/FejbyK/ha-cez-distribuce`, kategorie **Integrace**).
-2. Nainstalujte **ČEZ Distribuce** a restartujte Home Assistant.
+1. Klikněte na tlačítko **Otevřít repozitář v Marketplace** výše – nebo v Home Assistantu otevřete **Nastavení → Marketplace → Přidat z odkazu** a vložte `https://github.com/FejbyK/ha-cez-distribuce` (vlastní repozitář vyžaduje propojený GitHub účet).
+2. Nainstalujte **ČEZ Distribuce** (u starších verzí HA restartujte Home Assistant).
 3. Přidejte integraci v **Nastavení → Zařízení a služby → Přidat integraci → ČEZ Distribuce**.
 
-### Ručně
-
-1. Zkopírujte složku `custom_components/cez_distribuce` do `config/custom_components/`.
-2. Restartujte Home Assistant a přidejte integraci **ČEZ Distribuce**.
 
 ---
 
