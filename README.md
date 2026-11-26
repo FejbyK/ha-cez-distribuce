@@ -57,6 +57,7 @@
 
 
 <details>
+<img width="1817" height="733" alt="Graf spotřeby v Home Assistantu" src="https://github.com/user-attachments/assets/6277ae12-1542-4322-aa2e-8b8e3f60e37f" />
 
 </details>
 
