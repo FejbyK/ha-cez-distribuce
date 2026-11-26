@@ -36,8 +36,12 @@ from .const import (
     HDO_STATE_VT,
     OM_TYPE_CONSUMPTION,
     OM_TYPES_PRODUCTION,
+    STATISTIC_CONSUMPTION,
     STATISTIC_CONSUMPTION_NT,
     STATISTIC_CONSUMPTION_VT,
+    STATISTIC_COST_NT,
+    STATISTIC_COST_TOTAL,
+    STATISTIC_COST_VT,
 )
 from .coordinator import CezDistribuceCoordinator
 
@@ -83,7 +87,9 @@ async def async_setup_entry(
     """Nastaví senzory z config entry."""
     coordinator: CezDistribuceCoordinator = hass.data[DOMAIN][entry.entry_id]
     ean = entry.data[CONF_EAN]
-    hdo_signal = entry.data.get(CONF_HDO_SIGNAL, "")
+    hdo_signal = entry.options.get(
+        CONF_HDO_SIGNAL, entry.data.get(CONF_HDO_SIGNAL, "")
+    )
     # Chybí u config entries založených před přidáním rozlišení OM typu -
     # bere se jako běžná spotřeba, aby se chování stávajících instalací
     # nezměnilo (viz const.py).
@@ -109,19 +115,43 @@ async def async_setup_entry(
         _remove_stale_production_reading_entities(hass, ean)
         entities.append(CezTotalProductionSensor(coordinator, entry, ean))
     else:
+        signals_data = (coordinator.data or {}).get(DATA_SIGNALS)
+        is_single_tariff = (
+            not hdo_signal
+            and isinstance(signals_data, dict)
+            and not (signals_data.get("signals") or [])
+        )
         entities.extend(
             [
                 CezReadingSensor(coordinator, entry, ean, "VT"),
                 CezReadingSensor(coordinator, entry, ean, "NT"),
-                CezHdoStateSensor(coordinator, entry, ean, hdo_signal),
-                CezHdoScheduleSensor(coordinator, entry, ean, hdo_signal),
-                CezTariffBoundarySensor(coordinator, entry, ean, hdo_signal, HDO_STATE_VT, "start"),
-                CezTariffBoundarySensor(coordinator, entry, ean, hdo_signal, HDO_STATE_VT, "end"),
-                CezTariffBoundarySensor(coordinator, entry, ean, hdo_signal, HDO_STATE_NT, "start"),
-                CezTariffBoundarySensor(coordinator, entry, ean, hdo_signal, HDO_STATE_NT, "end"),
-                CezTariffCountdownSensor(coordinator, entry, ean, hdo_signal, HDO_STATE_VT),
-                CezTariffCountdownSensor(coordinator, entry, ean, hdo_signal, HDO_STATE_NT),
+            ]
+        )
+        if not is_single_tariff:
+            entities.extend(
+                [
+                    CezHdoStateSensor(coordinator, entry, ean, hdo_signal),
+                    CezHdoScheduleSensor(coordinator, entry, ean, hdo_signal),
+                    CezTariffBoundarySensor(coordinator, entry, ean, hdo_signal, HDO_STATE_VT, "start"),
+                    CezTariffBoundarySensor(coordinator, entry, ean, hdo_signal, HDO_STATE_VT, "end"),
+                    CezTariffBoundarySensor(coordinator, entry, ean, hdo_signal, HDO_STATE_NT, "start"),
+                    CezTariffBoundarySensor(coordinator, entry, ean, hdo_signal, HDO_STATE_NT, "end"),
+                    CezTariffCountdownSensor(coordinator, entry, ean, hdo_signal, HDO_STATE_VT),
+                    CezTariffCountdownSensor(coordinator, entry, ean, hdo_signal, HDO_STATE_NT),
+                ]
+            )
+        entities.extend(
+            [
                 CezTotalConsumptionSensor(coordinator, entry, ean),
+                CezMonthlyConsumptionSensor(coordinator, entry, ean),
+                CezMonthlyConsumptionSensor(coordinator, entry, ean, HDO_STATE_VT),
+                CezMonthlyConsumptionSensor(coordinator, entry, ean, HDO_STATE_NT),
+                CezMonthlyCostSensor(coordinator, entry, ean),
+                CezMonthlyCostSensor(coordinator, entry, ean, HDO_STATE_VT),
+                CezMonthlyCostSensor(coordinator, entry, ean, HDO_STATE_NT),
+                CezLastDayConsumptionSensor(coordinator, entry, ean),
+                CezLastDayConsumptionSensor(coordinator, entry, ean, HDO_STATE_VT),
+                CezLastDayConsumptionSensor(coordinator, entry, ean, HDO_STATE_NT),
                 CezMeterEstimateSensor(coordinator, entry, ean),
                 CezMeterEstimateTariffSensor(coordinator, entry, ean, HDO_STATE_VT),
                 CezMeterEstimateTariffSensor(coordinator, entry, ean, HDO_STATE_NT),
@@ -211,10 +241,18 @@ class CezCurrentPriceSensor(CezTimeAwareSensor):
         self._attr_name = "Aktuální cena"
         self._attr_device_info = _device_info(entry, ean)
 
+    def _is_single_tariff(self) -> bool:
+        if self._hdo_signal:
+            return False
+        signals_data = (self.coordinator.data or {}).get(DATA_SIGNALS)
+        return isinstance(signals_data, dict) and not (signals_data.get("signals") or [])
+
     @property
     def native_value(self) -> float | None:
         windows = _get_nt_windows_around_now(self.coordinator.data, self._hdo_signal)
         if windows is None:
+            if self._is_single_tariff():
+                return self._price_vt
             return None
 
         hdo_state = _current_hdo_state_from_windows(windows)
@@ -225,7 +263,12 @@ class CezCurrentPriceSensor(CezTimeAwareSensor):
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         windows = _get_nt_windows_around_now(self.coordinator.data, self._hdo_signal)
-        hdo_state = _current_hdo_state_from_windows(windows) if windows is not None else HDO_STATE_UNKNOWN
+        if windows is not None:
+            hdo_state = _current_hdo_state_from_windows(windows)
+        elif self._is_single_tariff():
+            hdo_state = HDO_STATE_VT
+        else:
+            hdo_state = HDO_STATE_UNKNOWN
 
         return {
             "stav_hdo": hdo_state,
@@ -509,7 +552,7 @@ class CezMeterEstimateSensor(CoordinatorEntity[CezDistribuceCoordinator], Sensor
     state_class TOTAL (ne TOTAL_INCREASING): při novém odečtu se základ
     přepne na skutečný stav a odhad se může nepatrně snížit - u
     TOTAL_INCREASING by to HA vyložil jako výměnu elektroměru. Pro
-    Energy dashboard je i tak lepší statistika cez:<ean>_consumption."""
+    Energy dashboard je i tak lepší statistika cez_distribuce:<ean>_consumption."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_state_class = SensorStateClass.TOTAL
@@ -627,13 +670,282 @@ class CezMeterEstimateTariffSensor(CoordinatorEntity[CezDistribuceCoordinator], 
         return attrs
 
 
+class CezMonthlyConsumptionSensor(CoordinatorEntity[CezDistribuceCoordinator], SensorEntity):
+    """Měsíční spotřeba elektřiny (celkem, VT nebo NT) za aktuální kalendářní měsíc.
+
+    Sčítá hodinové přírůstky dlouhodobých statistik (`consumption`,
+    `consumption_vt`, `consumption_nt`) od 1. dne aktuálního měsíce v lokální
+    časové zóně HA. Resetuje se každý 1. den v měsíci (state_class TOTAL +
+    last_reset). V atributech zobrazuje i náklady a souhrn minulého měsíce.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_suggested_display_precision = 2
+    _attr_icon = "mdi:calendar-month"
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: CezDistribuceCoordinator,
+        entry: ConfigEntry,
+        ean: str,
+        tariff: str | None = None,
+    ) -> None:
+        super().__init__(coordinator)
+        self._tariff = tariff
+        if tariff == HDO_STATE_VT:
+            self._value_key = "vt_kwh"
+            self._cost_key = "cost_vt"
+            self._prev_value_key = "prev_vt_kwh"
+            self._prev_cost_key = "prev_cost_vt"
+            self._stat_suffix = STATISTIC_CONSUMPTION_VT
+            self._attr_unique_id = f"{ean}_monthly_consumption_vt"
+            self._attr_name = "Měsíční VT spotřeba"
+        elif tariff == HDO_STATE_NT:
+            self._value_key = "nt_kwh"
+            self._cost_key = "cost_nt"
+            self._prev_value_key = "prev_nt_kwh"
+            self._prev_cost_key = "prev_cost_nt"
+            self._stat_suffix = STATISTIC_CONSUMPTION_NT
+            self._attr_unique_id = f"{ean}_monthly_consumption_nt"
+            self._attr_name = "Měsíční NT spotřeba"
+        else:
+            self._value_key = "total_kwh"
+            self._cost_key = "cost_total"
+            self._prev_value_key = "prev_total_kwh"
+            self._prev_cost_key = "prev_cost_total"
+            self._stat_suffix = STATISTIC_CONSUMPTION
+            self._attr_unique_id = f"{ean}_monthly_consumption"
+            self._attr_name = "Celková měsíční spotřeba"
+        self._attr_device_info = _device_info(entry, ean)
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Začátek aktuálního kalendářního měsíce v časové zóně HA."""
+        monthly = self.coordinator.monthly_consumption
+        if not monthly:
+            return None
+        return monthly.get("month_start")
+
+    @property
+    def native_value(self) -> float | None:
+        """Spotřeba za aktuální kalendářní měsíc v kWh."""
+        monthly = self.coordinator.monthly_consumption
+        if not monthly:
+            return None
+        val = monthly.get(self._value_key)
+        return round(val, 3) if val is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        monthly = self.coordinator.monthly_consumption
+        if not monthly:
+            return {}
+        attrs: dict[str, Any] = {
+            "mesic": monthly["month"],
+            "od": monthly["month_start"].isoformat(),
+            "hodinova_data_do": dt_util.as_local(monthly["data_until"]).isoformat(),
+            "pocet_hodin": monthly["hours"],
+            "statistic_id": self.coordinator.statistic_id_for(self._stat_suffix),
+        }
+        if self._tariff is None:
+            if monthly.get("vt_kwh") is not None:
+                attrs["vt_kwh"] = monthly["vt_kwh"]
+            if monthly.get("nt_kwh") is not None:
+                attrs["nt_kwh"] = monthly["nt_kwh"]
+        if monthly.get(self._cost_key) is not None:
+            attrs["naklady_mesic"] = monthly[self._cost_key]
+            attrs["mena"] = monthly["currency"]
+        attrs["minuly_mesic"] = monthly["prev_month"]
+        if monthly.get(self._prev_value_key) is not None:
+            attrs["minuly_mesic_kwh"] = monthly[self._prev_value_key]
+        if monthly.get(self._prev_cost_key) is not None:
+            attrs["minuly_mesic_naklady"] = monthly[self._prev_cost_key]
+        return attrs
+
+
+class CezMonthlyCostSensor(CoordinatorEntity[CezDistribuceCoordinator], SensorEntity):
+    """Měsíční náklady na elektřinu (celkem, VT nebo NT) za aktuální kalendářní měsíc.
+
+    Vychází z dlouhodobých nákladových statistik (`cost_total`, `cost_vt`, `cost_nt`)
+    spočítaných z 15min profilu spotřeby a nastavených cen VT/NT.
+    """
+
+    _attr_device_class = SensorDeviceClass.MONETARY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_suggested_display_precision = 2
+    _attr_icon = "mdi:cash-multiple"
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: CezDistribuceCoordinator,
+        entry: ConfigEntry,
+        ean: str,
+        tariff: str | None = None,
+    ) -> None:
+        super().__init__(coordinator)
+        self._tariff = tariff
+        if tariff == HDO_STATE_VT:
+            self._cost_key = "cost_vt"
+            self._energy_key = "vt_kwh"
+            self._prev_cost_key = "prev_cost_vt"
+            self._stat_suffix = STATISTIC_COST_VT
+            self._attr_unique_id = f"{ean}_monthly_cost_vt"
+            self._attr_name = "Měsíční náklady VT"
+        elif tariff == HDO_STATE_NT:
+            self._cost_key = "cost_nt"
+            self._energy_key = "nt_kwh"
+            self._prev_cost_key = "prev_cost_nt"
+            self._stat_suffix = STATISTIC_COST_NT
+            self._attr_unique_id = f"{ean}_monthly_cost_nt"
+            self._attr_name = "Měsíční náklady NT"
+        else:
+            self._cost_key = "cost_total"
+            self._energy_key = "total_kwh"
+            self._prev_cost_key = "prev_cost_total"
+            self._stat_suffix = STATISTIC_COST_TOTAL
+            self._attr_unique_id = f"{ean}_monthly_cost"
+            self._attr_name = "Celkové měsíční náklady"
+        self._attr_device_info = _device_info(entry, ean)
+
+    @property
+    def native_unit_of_measurement(self) -> str:
+        monthly = self.coordinator.monthly_consumption
+        if monthly and monthly.get("currency"):
+            return str(monthly["currency"])
+        return self.coordinator.currency
+
+    @property
+    def last_reset(self) -> datetime | None:
+        monthly = self.coordinator.monthly_consumption
+        if not monthly:
+            return None
+        return monthly.get("month_start")
+
+    @property
+    def native_value(self) -> float | None:
+        monthly = self.coordinator.monthly_consumption
+        if not monthly:
+            return None
+        val = monthly.get(self._cost_key)
+        return round(val, 2) if val is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        monthly = self.coordinator.monthly_consumption
+        if not monthly:
+            return {}
+        attrs: dict[str, Any] = {
+            "mesic": monthly["month"],
+            "od": monthly["month_start"].isoformat(),
+            "hodinova_data_do": dt_util.as_local(monthly["data_until"]).isoformat(),
+            "pocet_hodin": monthly["hours"],
+            "statistic_id": self.coordinator.statistic_id_for(self._stat_suffix),
+        }
+        if monthly.get(self._energy_key) is not None:
+            attrs["spotreba_kwh"] = monthly[self._energy_key]
+        if self._tariff is None:
+            if monthly.get("cost_vt") is not None:
+                attrs["naklady_vt"] = monthly["cost_vt"]
+            if monthly.get("cost_nt") is not None:
+                attrs["naklady_nt"] = monthly["cost_nt"]
+        attrs["minuly_mesic"] = monthly["prev_month"]
+        if monthly.get(self._prev_cost_key) is not None:
+            attrs["minuly_mesic_naklady"] = monthly[self._prev_cost_key]
+        return attrs
+
+
+class CezLastDayConsumptionSensor(CoordinatorEntity[CezDistribuceCoordinator], SensorEntity):
+    """Spotřeba elektřiny (celkem, VT nebo NT) za poslední uzavřený kalendářní den.
+
+    ČEZ hodinová data zveřejňuje zpětně kolem 1:00 v noci za předchozí den;
+    entita proto ukazuje vždy poslední kompletně dostupný den (typicky včerejšek).
+    """
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.TOTAL
+    _attr_native_unit_of_measurement = UnitOfEnergy.KILO_WATT_HOUR
+    _attr_suggested_display_precision = 2
+    _attr_icon = "mdi:calendar-today"
+    _attr_has_entity_name = True
+
+    def __init__(
+        self,
+        coordinator: CezDistribuceCoordinator,
+        entry: ConfigEntry,
+        ean: str,
+        tariff: str | None = None,
+    ) -> None:
+        super().__init__(coordinator)
+        self._tariff = tariff
+        if tariff == HDO_STATE_VT:
+            self._value_key = "vt_kwh"
+            self._cost_key = "cost_vt"
+            self._stat_suffix = STATISTIC_CONSUMPTION_VT
+            self._attr_unique_id = f"{ean}_last_day_consumption_vt"
+            self._attr_name = "Poslední den VT spotřeba"
+        elif tariff == HDO_STATE_NT:
+            self._value_key = "nt_kwh"
+            self._cost_key = "cost_nt"
+            self._stat_suffix = STATISTIC_CONSUMPTION_NT
+            self._attr_unique_id = f"{ean}_last_day_consumption_nt"
+            self._attr_name = "Poslední den NT spotřeba"
+        else:
+            self._value_key = "total_kwh"
+            self._cost_key = "cost_total"
+            self._stat_suffix = STATISTIC_CONSUMPTION
+            self._attr_unique_id = f"{ean}_last_day_consumption"
+            self._attr_name = "Poslední den spotřeba"
+        self._attr_device_info = _device_info(entry, ean)
+
+    @property
+    def last_reset(self) -> datetime | None:
+        last_day = self.coordinator.last_day_consumption
+        if not last_day:
+            return None
+        return last_day.get("day_start")
+
+    @property
+    def native_value(self) -> float | None:
+        last_day = self.coordinator.last_day_consumption
+        if not last_day:
+            return None
+        val = last_day.get(self._value_key)
+        return round(val, 3) if val is not None else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        last_day = self.coordinator.last_day_consumption
+        if not last_day:
+            return {}
+        attrs: dict[str, Any] = {
+            "datum": last_day["date"],
+            "od": last_day["day_start"].isoformat(),
+            "hodinova_data_do": dt_util.as_local(last_day["data_until"]).isoformat(),
+            "pocet_hodin": last_day["hours"],
+            "statistic_id": self.coordinator.statistic_id_for(self._stat_suffix),
+        }
+        if self._tariff is None:
+            if last_day.get("vt_kwh") is not None:
+                attrs["vt_kwh"] = last_day["vt_kwh"]
+            if last_day.get("nt_kwh") is not None:
+                attrs["nt_kwh"] = last_day["nt_kwh"]
+        if last_day.get(self._cost_key) is not None:
+            attrs["naklady"] = last_day[self._cost_key]
+            attrs["mena"] = last_day["currency"]
+        return attrs
+
+
 class CezTotalProductionSensor(CoordinatorEntity[CezDistribuceCoordinator], SensorEntity):
     """Celková dodávka (přetok) aktivní energie do sítě - odběrné místo
     typu výroba/mikrozdroj (FVE apod.).
 
     Zdrojem je součet hodinové dodávky z pnd/data (assemblyCode 06 -
     stejná data, která jdou do dlouhodobé statistiky
-    "cez:<ean>_production"), NE historie odečtů. Ta totiž pro výrobní
+    "cez_distribuce:<ean>_production"), NE historie odečtů. Ta totiž pro výrobní
     EAN vrací registry ODBĚRU téhož elektroměru (+E VT/NT) - verze
     2.0.7 je sčítala a "dodávka" tak byla do kWh shodná se spotřebou
     (issue #30, potvrzeno třemi nezávislými účty). Registr dodávky (-E)
@@ -643,7 +955,7 @@ class CezTotalProductionSensor(CoordinatorEntity[CezDistribuceCoordinator], Sens
     prvním spuštění zkouší až MAX_BACKFILL_YEARS let zpátky), ne stav
     registru elektroměru od jeho instalace - odkdy platí, říká atribut
     'od'. Pro Energy dashboard je vhodnější přímo statistika
-    "cez:<ean>_production" (viz README)."""
+    "cez_distribuce:<ean>_production" (viz README)."""
 
     _attr_device_class = SensorDeviceClass.ENERGY
     _attr_state_class = SensorStateClass.TOTAL_INCREASING
@@ -719,10 +1031,10 @@ class CezConsumptionFreshnessSensor(CoordinatorEntity[CezDistribuceCoordinator],
     """Do kdy máme uložená hodinová data spotřeby (diagnostická entita).
 
     Ukazuje konec poslední hodiny, kterou se podařilo naimportovat do
-    dlouhodobých statistik (statistic_id cez:<ean>_consumption). Pokud
+    dlouhodobých statistik (statistic_id cez_distribuce:<ean>_consumption). Pokud
     tahle hodnota přestane růst (zůstane trčet v minulosti), znamená to,
     že import hodinové spotřeby z nějakého důvodu selhává - podívej se
-    do logu na hlášky z custom_components.cez.coordinator. U odběratelů
+    do logu na hlášky z custom_components.cez_distribuce.coordinator. U odběratelů
     bez chytrého elektroměru (nebo bez dohledaného 'partner'/'anlage')
     zůstane trvale "Neznámý" - to je očekávané, ostatní senzory fungují
     normálně dál.

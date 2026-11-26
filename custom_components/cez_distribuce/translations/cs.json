@@ -59,11 +59,32 @@
   "options": {
     "step": {
       "init": {
-        "title": "Ceny elektřiny",
-        "description": "Ceny pro senzor Aktuální cena a nákladové statistiky (cost_vt, cost_nt, cost_total). Po uložení se integrace znovu načte.",
+        "title": "Tarif a ceny elektřiny",
+        "description": "Nastavení HDO signálu a cen pro senzor Aktuální cena, měsíční náklady a dlouhodobé statistiky. Po uložení se integrace znovu načte.",
         "data": {
+          "hdo_signal": "Kód HDO signálu",
           "price_vt": "Cena VT (Kč/kWh)",
           "price_nt": "Cena NT (Kč/kWh)"
+        }
+      }
+    }
+  },
+  "services": {
+    "recalculate_statistics": {
+      "name": "Přepočítat statistiky",
+      "description": "Zpětně přepočítá statistiky VT/NT spotřeby a nákladů za posledních N dní (např. po změně ceny elektřiny nebo HDO signálu).",
+      "fields": {
+        "ean": {
+          "name": "EAN",
+          "description": "Volitelný 18místný EAN konkrétního odběrného místa. Prázdné = přepočítat všechna spotřební odběrná místa."
+        },
+        "days": {
+          "name": "Počet dní",
+          "description": "Kolik dní zpět přepočítat (1 až 1095)."
+        },
+        "recalculate_costs_only": {
+          "name": "Přepočítat pouze náklady",
+          "description": "Přepočítá jen nákladové statistiky (cost_vt, cost_nt, cost_total) z existujících statistik VT/NT bez nového stahování dat z ČEZ MEPAS."
         }
       }
     }

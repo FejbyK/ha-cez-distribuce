@@ -59,11 +59,32 @@
   "options": {
     "step": {
       "init": {
-        "title": "Electricity prices",
-        "description": "Prices used by the Current price sensor and cost statistics (cost_vt, cost_nt, cost_total). The integration reloads after saving.",
+        "title": "Tariff and electricity prices",
+        "description": "HDO signal and prices used by the Current price sensor, monthly cost sensors and long-term statistics. The integration reloads after saving.",
         "data": {
+          "hdo_signal": "HDO signal code",
           "price_vt": "High tariff price (CZK/kWh)",
           "price_nt": "Low tariff price (CZK/kWh)"
+        }
+      }
+    }
+  },
+  "services": {
+    "recalculate_statistics": {
+      "name": "Recalculate statistics",
+      "description": "Recalculate VT/NT consumption and cost long-term statistics for the last N days (e.g. after changing electricity prices or HDO signal).",
+      "fields": {
+        "ean": {
+          "name": "EAN",
+          "description": "Optional 18-digit EAN of a specific supply point. Leave empty to recalculate all configured consumption supply points."
+        },
+        "days": {
+          "name": "Days",
+          "description": "Number of days backwards to recalculate (1 to 1095)."
+        },
+        "recalculate_costs_only": {
+          "name": "Recalculate costs only",
+          "description": "Only recalculate cost statistics (cost_vt, cost_nt, cost_total) from existing VT/NT statistics without re-fetching data from ČEZ MEPAS."
         }
       }
     }

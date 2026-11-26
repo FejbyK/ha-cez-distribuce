@@ -4,9 +4,10 @@ from __future__ import annotations
 import logging
 
 import aiohttp
+import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import (
     ConfigEntryAuthFailed,
     ConfigEntryError,
@@ -34,13 +35,65 @@ from .const import (
     DEFAULT_PRICE_NT,
     DEFAULT_PRICE_VT,
     DOMAIN,
+    MAX_BACKFILL_YEARS,
     OM_TYPE_CONSUMPTION,
+    SERVICE_RECALCULATE_STATISTICS,
 )
 from .coordinator import CezDistribuceCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]
+
+SERVICE_RECALCULATE_SCHEMA = vol.Schema(
+    {
+        vol.Optional(CONF_EAN): str,
+        vol.Optional("days", default=30): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=365 * MAX_BACKFILL_YEARS)
+        ),
+        vol.Optional("recalculate_costs_only", default=False): bool,
+    }
+)
+
+
+def _async_register_services(hass: HomeAssistant) -> None:
+    """Zaregistruje doménové služby ČEZ (pokud ještě nejsou registrované)."""
+    if hass.services.has_service(DOMAIN, SERVICE_RECALCULATE_STATISTICS):
+        return
+
+    async def _handle_recalculate(call: ServiceCall) -> None:
+        target_ean = (call.data.get(CONF_EAN) or "").strip()
+        days = int(call.data.get("days", 30))
+        recalculate_costs_only = bool(call.data.get("recalculate_costs_only", False))
+        coordinators = [
+            coord
+            for coord in (hass.data.get(DOMAIN) or {}).values()
+            if isinstance(coord, CezDistribuceCoordinator)
+        ]
+        matched = 0
+        for coordinator in coordinators:
+            if target_ean and coordinator.ean != target_ean:
+                continue
+            if not target_ean and coordinator.is_production:
+                continue
+            matched += 1
+            await coordinator.async_recalculate_statistics(
+                days=days, recalculate_costs_only=recalculate_costs_only
+            )
+        if target_ean and matched == 0:
+            _LOGGER.warning(
+                "Služba %s.%s: nebylo nalezeno žádné odběrné místo s EAN '%s'.",
+                DOMAIN,
+                SERVICE_RECALCULATE_STATISTICS,
+                target_ean,
+            )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_RECALCULATE_STATISTICS,
+        _handle_recalculate,
+        schema=SERVICE_RECALCULATE_SCHEMA,
+    )
 
 
 async def _async_enrich_partner_and_anlage(
@@ -181,30 +234,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if entry.data.get(CONF_PORTAL_ENVIRONMENT) and entry.data.get(CONF_PORTAL_PARTNER)
         else None
     )
-    session = aiohttp.ClientSession()
     client = CezDistribuceApiClient(
         username=username,
         password=password,
-        session=session,
         portal_environment=portal_environment,
     )
 
     try:
         await client.login()
     except CezInvalidCredentialsError as err:
-        await session.close()
+        await client.async_close()
         raise ConfigEntryAuthFailed(str(err)) from err
     except Exception as err:
         # Síť, timeout, změna přihlašovacího toku nebo mezikrok portálu
         # (podmínky, smlouva) - HA to zkusí znovu s rostoucím odstupem.
-        await session.close()
+        await client.async_close()
         raise ConfigEntryNotReady(f"Přihlášení do ČEZ selhalo: {err}") from err
 
-    entry.async_on_unload(session.close)
-    await _async_ensure_portal_environment(hass, entry, client, uid, ean)
+    entry.async_on_unload(client.async_close)
+    try:
+        await _async_ensure_portal_environment(hass, entry, client, uid, ean)
+    except Exception:
+        await client.async_close()
+        raise
     _LOGGER.debug("Přihlášení config entry dokončeno; pokračuji načtením dat.")
     partner = entry.data.get(CONF_PARTNER, "")
     anlage = entry.data.get(CONF_ANLAGE, "")
+    hdo_signal = entry.options.get(
+        CONF_HDO_SIGNAL, entry.data.get(CONF_HDO_SIGNAL, "")
+    )
     price_vt = float(
         entry.options.get(CONF_PRICE_VT, entry.data.get(CONF_PRICE_VT, DEFAULT_PRICE_VT))
     )
@@ -225,7 +283,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         partner=partner,
         anlage=anlage,
         om_type=om_type,
-        hdo_signal=entry.data.get(CONF_HDO_SIGNAL, ""),
+        hdo_signal=hdo_signal,
         price_vt=price_vt,
         price_nt=price_nt,
         on_uid_changed=_store_new_uid,
@@ -234,6 +292,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.debug("První načtení dat config entry dokončeno.")
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+    _async_register_services(hass)
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _LOGGER.debug("Platformy ČEZ byly načteny.")
@@ -251,5 +310,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Odstraní integraci."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+        if not hass.data.get(DOMAIN) and hass.services.has_service(
+            DOMAIN, SERVICE_RECALCULATE_STATISTICS
+        ):
+            hass.services.async_remove(DOMAIN, SERVICE_RECALCULATE_STATISTICS)
     return unload_ok

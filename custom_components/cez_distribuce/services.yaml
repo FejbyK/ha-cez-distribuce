@@ -1,0 +1,29 @@
+recalculate_statistics:
+  name: Recalculate statistics
+  description: Recalculate VT/NT consumption and cost long-term statistics for the last N days (e.g. after changing electricity prices or HDO signal).
+  fields:
+    ean:
+      name: EAN
+      description: Optional 18-digit EAN of a specific supply point. Leave empty to recalculate all configured consumption supply points.
+      required: false
+      example: "859182400100000000"
+      selector:
+        text:
+    days:
+      name: Days
+      description: Number of days backwards to recalculate (1 to 1095).
+      required: false
+      default: 30
+      selector:
+        number:
+          min: 1
+          max: 1095
+          mode: box
+          unit_of_measurement: d
+    recalculate_costs_only:
+      name: Recalculate costs only
+      description: Only recalculate cost statistics (cost_vt, cost_nt, cost_total) from existing VT/NT statistics without downloading data from ČEZ MEPAS again.
+      required: false
+      default: false
+      selector:
+        boolean:

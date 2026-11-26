@@ -15,7 +15,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 try:
-    # Jako součást HA balíčku custom_components.cez
+    # Jako součást HA balíčku custom_components.cez_distribuce
     from .const import (
         APP_BUILD_NUMBER,
         APP_VERSION,
@@ -337,7 +337,7 @@ class CezDistribuceApiClient:
         self,
         username: str,
         password: str,
-        session: aiohttp.ClientSession,
+        session: aiohttp.ClientSession | None = None,
         base_url: str = CEZ_DISTRIBUCE_BASE_URL,
         client_id: str = CEZ_DISTRIBUCE_CLIENT_ID,
         portal_environment: tuple[str, str] | None = None,
@@ -372,9 +372,15 @@ class CezDistribuceApiClient:
             f"&scope={SCOPE}"
         )
 
-        # Sdílíme jeden aiohttp session, ale potřebujeme oddělit cookie jary
+        # Oddělené cookie jary a znovupoužité sessions (keep-alive spojení
+        # bez opakovaných TCP/TLS handshaků při každém dotazu a při backfillu).
         self._auth_cookie_jar = aiohttp.CookieJar()
         self._anon_cookie_jar = aiohttp.CookieJar()
+        self._auth_cookies = self._auth_cookie_jar
+        self._anon_cookies = self._anon_cookie_jar
+        self._auth_session: aiohttp.ClientSession | None = None
+        self._anon_session: aiohttp.ClientSession | None = None
+        self._mepas_session: aiohttp.ClientSession | None = None
 
         # Tokeny pro ČEZ API
         self._api_token: str | None = None
@@ -386,6 +392,49 @@ class CezDistribuceApiClient:
         # na neplatný/chybějící token.
         self._mepas_access_token: str | None = None
         self._mepas_installation_id = uuid.uuid4().hex[:16]
+
+    def _get_auth_session(self) -> aiohttp.ClientSession:
+        """Znovupoužitá session pro autentizovaný portál (velké hlavičky CAS/SAP)."""
+        if self._auth_session is None or self._auth_session.closed:
+            self._auth_session = aiohttp.ClientSession(
+                cookie_jar=self._auth_cookie_jar,
+                max_line_size=8190 * 4,
+                max_field_size=8190 * 4,
+                timeout=REQUEST_TIMEOUT,
+            )
+        return self._auth_session
+
+    def _get_anon_session(self) -> aiohttp.ClientSession:
+        """Znovupoužitá session pro anonymní portálové dotazy."""
+        if self._anon_session is None or self._anon_session.closed:
+            self._anon_session = aiohttp.ClientSession(
+                cookie_jar=self._anon_cookie_jar,
+                timeout=REQUEST_TIMEOUT,
+            )
+        return self._anon_session
+
+    def _get_mepas_session(self) -> aiohttp.ClientSession:
+        """Znovupoužitá session pro MEPAS / AWS Gateway (keep-alive přes více oken)."""
+        if self._mepas_session is None or self._mepas_session.closed:
+            self._mepas_session = aiohttp.ClientSession(
+                cookie_jar=aiohttp.DummyCookieJar(),
+                timeout=REQUEST_TIMEOUT,
+            )
+        return self._mepas_session
+
+    async def async_close(self) -> None:
+        """Zavře všechny interní HTTP sessions klienta."""
+        for attr in ("_auth_session", "_anon_session", "_mepas_session"):
+            session = getattr(self, attr)
+            if session is not None and not session.closed:
+                await session.close()
+            setattr(self, attr, None)
+
+    async def __aenter__(self) -> CezDistribuceApiClient:
+        return self
+
+    async def __aexit__(self, *_: object) -> None:
+        await self.async_close()
 
     # ------------------------------------------------------------------
     # Přihlášení (portál)
@@ -409,141 +458,133 @@ class CezDistribuceApiClient:
         # pole 'execution' a login selže (viz issue #21).
         self._auth_cookie_jar.clear()
 
-        connector = aiohttp.TCPConnector()
-        async with aiohttp.ClientSession(
-            connector=connector,
-            max_line_size=8190 * 4,
-            max_field_size=8190 * 4,
-            timeout=REQUEST_TIMEOUT,
-        ) as auth_session:
-            auth_session._cookie_jar = self._auth_cookie_jar  # noqa: SLF001
+        auth_session = self._get_auth_session()
 
-            # Krok 1 – GET authorize (jako prohlížeč). Bez SSO session nás
-            # CAS přesměruje na /cas/login?service=... s formulářem; resp.url
-            # je pak ta login URL, na kterou míří POST v kroku 2.
-            _LOGGER.debug("CAS authorize požadavek: endpoint=%s", _safe_endpoint(self._authorize_url))
-            async with auth_session.get(self._authorize_url) as resp:
-                login_url = str(resp.url)
+        # Krok 1 – GET authorize (jako prohlížeč). Bez SSO session nás
+        # CAS přesměruje na /cas/login?service=... s formulářem; resp.url
+        # je pak ta login URL, na kterou míří POST v kroku 2.
+        _LOGGER.debug("CAS authorize požadavek: endpoint=%s", _safe_endpoint(self._authorize_url))
+        async with auth_session.get(self._authorize_url) as resp:
+            login_url = str(resp.url)
+            html = await resp.text()
+            _LOGGER.debug(
+                "CAS authorize odpověď: HTTP=%d endpoint=%s content_type=%s redirects=%d",
+                resp.status,
+                _safe_endpoint(login_url),
+                resp.headers.get("Content-Type", "neznámý"),
+                len(resp.history),
+            )
+        if "/cas/login" not in login_url:
+            raise CezAuthError(
+                f"CAS authorize: neočekávané přesměrování na {login_url!r}"
+            )
+
+        soup = BeautifulSoup(html, "html.parser")
+        execution_input = soup.find("input", {"name": "execution"})
+        if not execution_input:
+            raise CezAuthError("Nepodařilo se najít execution token na přihlašovací stránce.")
+        execution = execution_input.get("value", "")
+
+        # Krok 2 – POST přihlašovacích údajů. Řetěz přesměrování končí
+        # na portálu /irj/portal?code=... - tím je kód doručen a session
+        # založená. Landing iView SAP portálu ale ne-browserovému
+        # User-Agentu vrací 404 ("Could not open iView. The iView is not
+        # compatible with your browser..."); to je kosmetické, cookies
+        # jsou nastavené a /token/get níž funguje (issue #24).
+        _LOGGER.debug("Odesílám přihlašovací formulář CAS na endpoint=%s", _safe_endpoint(login_url))
+        async with auth_session.post(
+            login_url,
+            data={
+                "username": self._username,
+                "password": self._password,
+                "execution": execution,
+                "_eventId": "submit",
+                "geolocation": "",
+            },
+        ) as resp:
+            landed_on_portal = resp.url.host == self._portal_host
+            landed_with_code = landed_on_portal and "code" in resp.url.query
+            _LOGGER.debug(
+                "Login POST skončil: HTTP %s, host=%s, path=%s, code=%s, redirectů=%d",
+                resp.status,
+                resp.url.host,
+                resp.url.path,
+                landed_with_code,
+                len(resp.history),
+            )
+            if resp.status == 404 and landed_with_code:
+                _LOGGER.debug(
+                    "Portál vrátil 404 z landing iView, kód doručen - pokračuji"
+                )
+            elif resp.status not in (200, 302):
                 html = await resp.text()
-                _LOGGER.debug(
-                    "CAS authorize odpověď: HTTP=%d endpoint=%s content_type=%s redirects=%d",
-                    resp.status,
-                    _safe_endpoint(login_url),
-                    resp.headers.get("Content-Type", "neznámý"),
-                    len(resp.history),
-                )
-            if "/cas/login" not in login_url:
-                raise CezAuthError(
-                    f"CAS authorize: neočekávané přesměrování na {login_url!r}"
-                )
-
-            soup = BeautifulSoup(html, "html.parser")
-            execution_input = soup.find("input", {"name": "execution"})
-            if not execution_input:
-                raise CezAuthError("Nepodařilo se najít execution token na přihlašovací stránce.")
-            execution = execution_input.get("value", "")
-
-            # Krok 2 – POST přihlašovacích údajů. Řetěz přesměrování končí
-            # na portálu /irj/portal?code=... - tím je kód doručen a session
-            # založená. Landing iView SAP portálu ale ne-browserovému
-            # User-Agentu vrací 404 ("Could not open iView. The iView is not
-            # compatible with your browser..."); to je kosmetické, cookies
-            # jsou nastavené a /token/get níž funguje (issue #24).
-            _LOGGER.debug("Odesílám přihlašovací formulář CAS na endpoint=%s", _safe_endpoint(login_url))
-            async with auth_session.post(
-                login_url,
-                data={
-                    "username": self._username,
-                    "password": self._password,
-                    "execution": execution,
-                    "_eventId": "submit",
-                    "geolocation": "",
-                },
-            ) as resp:
-                landed_on_portal = resp.url.host == self._portal_host
-                landed_with_code = landed_on_portal and "code" in resp.url.query
-                _LOGGER.debug(
-                    "Login POST skončil: HTTP %s, host=%s, path=%s, code=%s, redirectů=%d",
-                    resp.status,
-                    resp.url.host,
-                    resp.url.path,
-                    landed_with_code,
-                    len(resp.history),
-                )
-                if resp.status == 404 and landed_with_code:
-                    _LOGGER.debug(
-                        "Portál vrátil 404 z landing iView, kód doručen - pokračuji"
+                _log_unexpected_page("login POST", str(resp.url), resp.status, html)
+                raise CezAuthError(f"Přihlášení selhalo, HTTP {resp.status}")
+            else:
+                html = await resp.text()
+                if "Nesprávné" in html or "incorrect" in html.lower():
+                    raise CezInvalidCredentialsError("Nesprávné přihlašovací údaje.")
+                if not landed_on_portal and _is_login_form(html):
+                    # CAS vrátil znovu přihlašovací formulář = údaje
+                    # neprošly, jen s jinou hláškou než "Nesprávné".
+                    raise CezInvalidCredentialsError("Nesprávné přihlašovací údaje.")
+                if not landed_on_portal:
+                    # Řetěz přesměrování zůstal na CAS (mepas.cez.cz) -
+                    # CAS chce po uživateli ještě něco (výběr účtu,
+                    # souhlas, změna hesla...). Bez toho /token/get
+                    # vrátí HTML portálu a chyba by byla matoucí.
+                    info = _log_unexpected_page(
+                        "login POST", str(resp.url), resp.status, html
                     )
-                elif resp.status not in (200, 302):
-                    html = await resp.text()
-                    _log_unexpected_page("login POST", str(resp.url), resp.status, html)
-                    raise CezAuthError(f"Přihlášení selhalo, HTTP {resp.status}")
-                else:
-                    html = await resp.text()
-                    if "Nesprávné" in html or "incorrect" in html.lower():
-                        raise CezInvalidCredentialsError("Nesprávné přihlašovací údaje.")
-                    if not landed_on_portal and _is_login_form(html):
-                        # CAS vrátil znovu přihlašovací formulář = údaje
-                        # neprošly, jen s jinou hláškou než "Nesprávné".
-                        raise CezInvalidCredentialsError("Nesprávné přihlašovací údaje.")
-                    if not landed_on_portal:
-                        # Řetěz přesměrování zůstal na CAS (mepas.cez.cz) -
-                        # CAS chce po uživateli ještě něco (výběr účtu,
-                        # souhlas, změna hesla...). Bez toho /token/get
-                        # vrátí HTML portálu a chyba by byla matoucí.
-                        info = _log_unexpected_page(
-                            "login POST", str(resp.url), resp.status, html
-                        )
-                        raise CezUnexpectedLoginPageError(
-                            "Po přihlášení CAS nepřesměroval na portál "
-                            f"(zůstal na {info['host']}{info['path']}). "
-                            "Pravděpodobně je vyžadován mezikrok, např. výběr účtu."
-                        )
+                    raise CezUnexpectedLoginPageError(
+                        "Po přihlášení CAS nepřesměroval na portál "
+                        f"(zůstal na {info['host']}{info['path']}). "
+                        "Pravděpodobně je vyžadován mezikrok, např. výběr účtu."
+                    )
 
-            # Krok 3 – načíst API token (autentizovaný)
-            token_url = f"{self._base_url}/rest-auth-api?path=/token/get"
-            async with auth_session.get(token_url) as resp:
-                try:
-                    data = await self._read_json_response(resp, token_url)
-                except _InvalidJsonResponse as err:
-                    if err.looks_like_portal_html:
-                        html = await resp.text()
-                        page = _describe_page(str(resp.url), resp.status, html)
-                        if _is_generic_portal_page(page):
-                            # Obecná stránka portálu bez formuláře = API je
-                            # dočasně nedostupné (noční údržba), ne výběr
-                            # účtu. Nežádat uživatele o hlášení do issue.
-                            page.pop("_text_preview", None)
-                            _LOGGER.debug(
-                                "ČEZ token/get vrátil obecnou stránku portálu: %s",
-                                json.dumps(page, ensure_ascii=False),
-                            )
-                            raise CezPortalUnavailableError(
-                                "Portál ČEZ Distribuce je dočasně nedostupný "
-                                "(místo API tokenu vrátil úvodní stránku, "
-                                "pravděpodobně údržba). Zkusím to znovu později."
-                            ) from err
-                        _log_unexpected_page("token/get", str(resp.url), resp.status, html)
-                        raise CezUnexpectedLoginPageError(
-                            "Portál po přihlášení nevydal API token (vrátil HTML). "
-                            "Pravděpodobně je vyžadován mezikrok, např. výběr účtu."
+        # Krok 3 – načíst API token (autentizovaný)
+        token_url = f"{self._base_url}/rest-auth-api?path=/token/get"
+        async with auth_session.get(token_url) as resp:
+            try:
+                data = await self._read_json_response(resp, token_url)
+            except _InvalidJsonResponse as err:
+                if err.looks_like_portal_html:
+                    html = await resp.text()
+                    page = _describe_page(str(resp.url), resp.status, html)
+                    if _is_generic_portal_page(page):
+                        # Obecná stránka portálu bez formuláře = API je
+                        # dočasně nedostupné (noční údržba), ne výběr
+                        # účtu. Nežádat uživatele o hlášení do issue.
+                        page.pop("_text_preview", None)
+                        _LOGGER.debug(
+                            "ČEZ token/get vrátil obecnou stránku portálu: %s",
+                            json.dumps(page, ensure_ascii=False),
+                        )
+                        raise CezPortalUnavailableError(
+                            "Portál ČEZ Distribuce je dočasně nedostupný "
+                            "(místo API tokenu vrátil úvodní stránku, "
+                            "pravděpodobně údržba). Zkusím to znovu později."
                         ) from err
-                    raise
-                self._api_token = data if isinstance(data, str) else data.get("data") or data.get("token")
+                    _log_unexpected_page("token/get", str(resp.url), resp.status, html)
+                    raise CezUnexpectedLoginPageError(
+                        "Portál po přihlášení nevydal API token (vrátil HTML). "
+                        "Pravděpodobně je vyžadován mezikrok, např. výběr účtu."
+                    ) from err
+                raise
+            self._api_token = data if isinstance(data, str) else data.get("data") or data.get("token")
 
-            # Krok 3b – mezikroky landing stránky (výběr prostředí, issue #37)
-            await self._complete_landing_checks(auth_session)
-
-            # Uložit cookies pro pozdější použití
-            self._auth_cookies = auth_session.cookie_jar
+        # Krok 3b – mezikroky landing stránky (výběr prostředí, issue #37)
+        await self._complete_landing_checks(auth_session)
+        self._auth_cookies = self._auth_cookie_jar
 
         # Krok 4 – anonymní token (nový session bez přihlášení)
-        async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as anon_session:
-            token_url = f"{self._base_url}/anonymous/rest-auth-api?path=/token/get"
-            async with anon_session.get(token_url) as resp:
-                data = await self._read_json_response(resp, token_url)
-                self._anon_api_token = data if isinstance(data, str) else data.get("data") or data.get("token")
-            self._anon_cookies = anon_session.cookie_jar
+        self._anon_cookie_jar.clear()
+        anon_session = self._get_anon_session()
+        token_url = f"{self._base_url}/anonymous/rest-auth-api?path=/token/get"
+        async with anon_session.get(token_url) as resp:
+            data = await self._read_json_response(resp, token_url)
+            self._anon_api_token = data if isinstance(data, str) else data.get("data") or data.get("token")
+        self._anon_cookies = self._anon_cookie_jar
 
         _LOGGER.debug("Přihlášení OK, tokeny načteny.")
 
@@ -724,10 +765,8 @@ class CezDistribuceApiClient:
         """Přepne prostředí portálu v rámci existující session (config flow)."""
         if (environment_id, partner_id) == self._portal_environment:
             return
-        async with aiohttp.ClientSession(
-            cookie_jar=self._auth_cookies, timeout=REQUEST_TIMEOUT
-        ) as session:
-            await self._post_select_environment(session, environment_id, partner_id)
+        session = self._get_auth_session()
+        await self._post_select_environment(session, environment_id, partner_id)
         self._portal_environment = (environment_id, partner_id)
         self.preferred_environment_missing = False
 
@@ -932,15 +971,15 @@ class CezDistribuceApiClient:
                 await self.login_mepas()
 
             headers = self._mepas_headers(is_post=(method == "POST"))
-            async with aiohttp.ClientSession(timeout=REQUEST_TIMEOUT) as s:
-                if method == "GET":
-                    async with s.get(url, headers=headers) as resp:
-                        text = await resp.text()
-                        status = resp.status
-                else:
-                    async with s.post(url, headers=headers, json=json_body or {}) as resp:
-                        text = await resp.text()
-                        status = resp.status
+            s = self._get_mepas_session()
+            if method == "GET":
+                async with s.get(url, headers=headers) as resp:
+                    text = await resp.text()
+                    status = resp.status
+            else:
+                async with s.post(url, headers=headers, json=json_body or {}) as resp:
+                    text = await resp.text()
+                    status = resp.status
 
             if status in (401, 403):
                 # DŮLEŽITÉ: uchováváme tělo odpovědi, protože 403 nemusí
@@ -1058,16 +1097,15 @@ class CezDistribuceApiClient:
             elif not authenticated and self._anon_api_token:
                 headers["X-Request-Token"] = self._anon_api_token
 
-            cookies = self._auth_cookies if authenticated else self._anon_cookies
+            s = self._get_auth_session() if authenticated else self._get_anon_session()
 
             try:
-                async with aiohttp.ClientSession(cookie_jar=cookies, timeout=REQUEST_TIMEOUT) as s:
-                    if method == "GET":
-                        async with s.get(url, headers=headers) as resp:
-                            raw = await self._read_json_response(resp, url)
-                    else:
-                        async with s.post(url, headers=headers, json=json or {}) as resp:
-                            raw = await self._read_json_response(resp, url)
+                if method == "GET":
+                    async with s.get(url, headers=headers) as resp:
+                        raw = await self._read_json_response(resp, url)
+                else:
+                    async with s.post(url, headers=headers, json=json or {}) as resp:
+                        raw = await self._read_json_response(resp, url)
             except _InvalidJsonResponse as err:
                 if authenticated and err.looks_like_portal_html and attempt < LOGIN_RETRIES - 1:
                     _LOGGER.debug(

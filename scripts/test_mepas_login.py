@@ -10,7 +10,7 @@ Volitelné proměnné:
     CEZ_FLOW=browser   začít authorize requestem jako prohlížeč (viz FLOW níže)
     CEZ_UA='...'       podstrčit jiný User-Agent (kontrola prohlížeče SAP portálu)
 
-Skript projde stejné kroky jako custom_components/cez/api.py a u každého
+Skript projde stejné kroky jako custom_components/cez_distribuce/api.py a u každého
 vypíše, co se stalo — ideální pro ověření, že host mepas.cez.cz a nový
 client_id fungují.
 """

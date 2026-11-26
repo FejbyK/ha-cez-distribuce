@@ -33,12 +33,16 @@ jobs:
             - name: Check integration structure
               run: |
                   # Verify required files exist
-                  test -f custom_components/cez/__init__.py
-                  test -f custom_components/cez/manifest.json
+                  test -f custom_components/cez_distribuce/__init__.py
+                  test -f custom_components/cez_distribuce/manifest.json
                   test -f hacs.json
                   test -f README.md
                   echo "✅ All required files present"
 
                   # Verify no Python syntax errors
-                  python -m py_compile custom_components/cez/*.py
+                  python -m py_compile custom_components/cez_distribuce/*.py
                   echo "✅ Python syntax validation passed"
+
+                  # Run unit tests
+                  python -m unittest discover -s tests -v
+                  echo "✅ Unit tests passed"

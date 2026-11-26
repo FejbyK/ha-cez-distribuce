@@ -193,3 +193,8 @@ TODO.md
 
 # Lokální drafty komentářů/PR - nikdy nepushovat do repa
 docs/drafts/
+
+# Diagnostické výstupy skriptu test_pnd_consumption.py a lokální AI skills
+pnd_raw_*.json
+pnd_hourly_*.csv
+skills/

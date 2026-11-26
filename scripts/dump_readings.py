@@ -24,17 +24,15 @@ import os
 import sys
 from pathlib import Path
 
-import aiohttp
-
-# Načteme api.py přímo ze souboru, ne přes balíček custom_components.cez –
+# Načteme api.py přímo ze souboru, ne přes balíček custom_components.cez_distribuce –
 # ten při importu spouští __init__.py, který vyžaduje nainstalovaný
 # Home Assistant. api.py sám na Home Assistantu nezávisí (jen aiohttp/bs4).
 #
 # api.py od verze s hodinovou spotřebou navíc importuje const.py (MEPAS
 # konstanty) - když selže relativní "from .const import" (nejsme balíček),
-# spadne na bare "from const import", což vyžaduje mít složku cez/ na
+# spadne na bare "from const import", což vyžaduje mít složku cez_distribuce/ na
 # sys.path.
-_CEZ_DIR = Path(__file__).resolve().parent.parent / "custom_components" / "cez"
+_CEZ_DIR = Path(__file__).resolve().parent.parent / "custom_components" / "cez_distribuce"
 if str(_CEZ_DIR) not in sys.path:
     sys.path.insert(0, str(_CEZ_DIR))
 
@@ -62,8 +60,7 @@ async def main() -> int:
         print("Nastav proměnné CEZ_USER a CEZ_PASS.", file=sys.stderr)
         return 2
 
-    async with aiohttp.ClientSession() as session:
-        client = CezDistribuceApiClient(username=username, password=password, session=session)
+    async with CezDistribuceApiClient(username=username, password=password) as client:
 
         _print_section("Přihlašuji se…")
         await client.login()

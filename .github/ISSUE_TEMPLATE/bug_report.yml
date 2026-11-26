@@ -42,8 +42,8 @@ body:
     id: version
     attributes:
       label: Verze integrace
-      description: Jakou verzi ČEZ HDO používáte?
-      placeholder: "např. 2.2.0"
+      description: Jakou verzi ČEZ Distribuce používáte?
+      placeholder: "např. 1.0.0"
     validations:
       required: true
 
@@ -74,7 +74,7 @@ body:
       label: Debug logy
       description: |
         **Jak získat debug logy:**
-        1. Nastavení → Zařízení a služby → ČEZ HDO
+        1. Nastavení → Zařízení a služby → ČEZ Distribuce
         2. Klikněte na ⋮ (tři tečky) → **Povolit logování ladících informací**
         3. Proveďte kroky vedoucí k chybě
         4. Klikněte na informační banner "Logování ladících informací povoleno" → **Zakázat**
@@ -90,8 +90,8 @@ body:
       label: Diagnostická data
       description: |
         **Jak exportovat diagnostiku:**
-        1. Nastavení → Zařízení a služby → ČEZ HDO
-        2. Klikněte na zařízení "ČEZ HDO XXXXXX"
+        1. Nastavení → Zařízení a služby → ČEZ Distribuce
+        2. Klikněte na zařízení odběrného místa
         3. Klikněte na ⋮ (tři tečky) vpravo nahoře
         4. Vyberte **Stáhnout diagnostiku**
         5. Přiložte stažený JSON soubor k tomuto issue

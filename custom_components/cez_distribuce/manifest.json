@@ -1,0 +1,15 @@
+{
+  "domain": "cez_distribuce",
+  "name": "ČEZ Distribuce",
+  "after_dependencies": ["recorder"],
+  "categories": ["energy.meters_monitoring"],
+  "codeowners": ["@FejbyK"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/FejbyK/CEZ",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/FejbyK/CEZ/issues",
+  "quality_scale": "silver",
+  "requirements": [],
+  "version": "1.0.0"
+}

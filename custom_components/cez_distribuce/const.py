@@ -1,6 +1,6 @@
 """Konstanty pro ČEZ integraci."""
 
-DOMAIN = "cez"
+DOMAIN = "cez_distribuce"
 
 # Konfigurační klíče
 CONF_USERNAME = "username"
@@ -75,7 +75,7 @@ HDO_STATE_VT = "VT"
 HDO_STATE_NT = "NT"
 HDO_STATE_UNKNOWN = "Neznámý"
 
-# Přípony externích dlouhodobých statistik (cez:<ean>_<suffix>)
+# Přípony externích dlouhodobých statistik (cez_distribuce:<ean>_<suffix>)
 STATISTIC_CONSUMPTION = "consumption"
 STATISTIC_CONSUMPTION_VT = "consumption_vt"
 STATISTIC_CONSUMPTION_NT = "consumption_nt"
@@ -83,6 +83,9 @@ STATISTIC_COST_VT = "cost_vt"
 STATISTIC_COST_NT = "cost_nt"
 STATISTIC_COST_TOTAL = "cost_total"
 STATISTIC_PRODUCTION = "production"
+
+# Služby Home Assistantu
+SERVICE_RECALCULATE_STATISTICS = "recalculate_statistics"
 
 # --- MEPAS / AWS Gateway (appka "Proud") - hodinová/15min spotřeba --------
 #
@@ -220,6 +223,7 @@ def pnd_max_interval_days_for(assembly_code: str) -> int:
 # do více požadavků po sobě.
 MAX_PND_INTERVAL_DAYS = 366
 MAX_PND_15MIN_INTERVAL_DAYS = 90
+MAX_BACKFILL_YEARS = 3
 
 DATA_PND_LAST_IMPORTED = "pnd_last_imported"
 
@@ -243,3 +247,8 @@ PND_GAP_REPAIR_INTERVAL_HOURS = 24
 # podezřelá díra (jednotlivá nulová hodina může být reálná). U výroby se
 # nuly nekontrolují vůbec - v noci jsou normální.
 PND_GAP_ZERO_RUN_HOURS = 3
+
+# Jak často se dotazovat MEPAS/pnd/data, pokud už máme kompletní data až do
+# dnešní lokální půlnoci (ČEZ běžně publikuje celý včerejší den najednou
+# v noci). Dokud včerejšek chybí, dotazuje se každou hodinu.
+PND_FRESH_POLL_INTERVAL_HOURS = 4

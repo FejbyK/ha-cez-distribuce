@@ -39,11 +39,13 @@ from .const import (
     DEFAULT_PRICE_NT,
     DEFAULT_PRICE_VT,
     DOMAIN,
+    MAX_BACKFILL_YEARS,
     OM_TYPE_CONSUMPTION,
     OM_TYPES_PRODUCTION,
     PND_ASSEMBLY_15MIN,
     PND_ASSEMBLY_DAILY_REGISTERS,
     PND_ASSEMBLY_HOURLY,
+    PND_FRESH_POLL_INTERVAL_HOURS,
     PND_GAP_REPAIR_INTERVAL_HOURS,
     PND_GAP_SCAN_DAYS,
     PND_GAP_ZERO_RUN_HOURS,
@@ -81,6 +83,7 @@ from .pnd_processing import (
     process_pnd_points,
     reading_baseline,
     reading_registers,
+    rows_differ_from_existing,
     summarize_pnd_points,
 )
 
@@ -91,12 +94,6 @@ _LOGGER = logging.getLogger(__name__)
 # i plány dní, které už portál neukazuje.
 HDO_HISTORY_STORAGE_VERSION = 1
 
-# Jak daleko do minulosti se má integrace pokusit dohledat data při úplně
-# prvním spuštění (kdy ještě neexistují žádné dlouhodobé statistiky).
-# Pokud chytrý elektroměr existuje kratší dobu, starší okna jednoduše
-# vrátí prázdno/chybu - to se jen zaloguje a přeskočí, neshodí zbytek
-# aktualizace.
-MAX_BACKFILL_YEARS = 3
 
 
 class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -187,8 +184,19 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # nebo když statistika okamžik odečtu nepokrývá.
         self.meter_estimate: dict[str, Any] | None = None
 
-        # Kdy naposledy proběhla kontrola děr ve statistice starších než
-        # přeimportovací okno (issue #40) - viz _async_find_old_statistic_gap.
+        # Měsíční souhrn spotřeby (celkem / VT / NT + náklady) pro aktuální a
+        # předchozí kalendářní měsíc a poslední uzavřený den v lokální zóně HA.
+        # Čtou ho entity CezMonthlyConsumptionSensor, CezMonthlyCostSensor a
+        # CezLastDayConsumptionSensor v sensor.py.
+        self.monthly_consumption: dict[str, Any] | None = None
+        self.last_day_consumption: dict[str, Any] | None = None
+        # Hodinové delty zapsané v posledním běhu _async_update_pnd_statistics
+        # (aby měsíční senzory ihned po importu/backfillu nečekaly na flush
+        # fronty Recorderu).
+        self._latest_pnd_batch: dict[str, dict[datetime, float]] = {}
+
+        # Kdy naposledy proběhl dotaz na MEPAS/pnd/data a kontrola starších děr.
+        self._last_pnd_fetch: datetime | None = None
         self._last_gap_scan: datetime | None = None
 
         super().__init__(
@@ -197,6 +205,16 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             name=DOMAIN,
             update_interval=timedelta(seconds=UPDATE_INTERVAL_SECONDS),
         )
+
+    @property
+    def ean(self) -> str:
+        """EAN odběrného místa tohoto koordinátoru."""
+        return self._ean
+
+    @property
+    def is_production(self) -> bool:
+        """True, pokud jde o výrobní / mikrozdrojové odběrné místo."""
+        return self._is_production
 
     @property
     def uid(self) -> str:
@@ -305,6 +323,15 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "Výpočet odhadovaného stavu elektroměru selhal "
                         "(ostatní senzory tím nejsou dotčeny, issue #40)."
                     )
+                try:
+                    await self._async_update_monthly_consumption(merged_data.get(DATA_SIGNALS))
+                except Exception:  # noqa: BLE001
+                    self.monthly_consumption = None
+                    self.last_day_consumption = None
+                    _LOGGER.exception(
+                        "Výpočet měsíční spotřeby (celkem/VT/NT) selhal "
+                        "(ostatní senzory tím nejsou dotčeny)."
+                    )
         else:
             _LOGGER.debug(
                 "Přeskakuji import hodinové spotřeby - chybí 'partner'/'anlage' "
@@ -375,10 +402,10 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
     # 15min/hodinová spotřeba (appka Proud, MEPAS/AWS Gateway) jako
     # externí dlouhodobé statistiky pro HA Energy Dashboard:
-    # - celková spotřeba (cez:<ean>_consumption)
-    # - spotřeba VT / NT podle plánu HDO (cez:<ean>_consumption_vt / _nt)
-    # - náklady VT / NT / celkem (cez:<ean>_cost_vt / _nt / _total)
-    # - dodávka do sítě u FVE (cez:<ean>_production)
+    # - celková spotřeba (cez_distribuce:<ean>_consumption)
+    # - spotřeba VT / NT podle plánu HDO (cez_distribuce:<ean>_consumption_vt / _nt)
+    # - náklady VT / NT / celkem (cez_distribuce:<ean>_cost_vt / _nt / _total)
+    # - dodávka do sítě u FVE (cez_distribuce:<ean>_production)
     # ------------------------------------------------------------------
 
     def statistic_id_for(self, suffix: str) -> str:
@@ -390,7 +417,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @property
     def statistic_id(self) -> str:
         """ID hlavní dlouhodobé statistiky tohoto odběrného místa
-        ("cez:<ean>_consumption" / "cez:<ean>_production")."""
+        ("cez_distribuce:<ean>_consumption" / "cez_distribuce:<ean>_production")."""
         return self._statistic_id()
 
     @property
@@ -415,6 +442,11 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Měna nastavená v Home Assistantu pro nákladové statistiky."""
         currency = getattr(getattr(self.hass, "config", None), "currency", None)
         return str(currency or "CZK").upper()
+
+    @property
+    def currency(self) -> str:
+        """Veřejná měna pro nákladové senzory."""
+        return self._currency()
 
     def _build_metadata(
         self,
@@ -554,6 +586,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         unit_of_measurement: str | None,
         unit_class: str | None,
         precision: int = 4,
+        force_write: bool = False,
     ) -> float | None:
         """Zapíše hodinové přírůstky do externí statistiky se zachováním
         monotonie, sloučením s existujícími body a posunem následných sum."""
@@ -589,6 +622,17 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not statistics:
             return None
 
+        if not force_write and not rows_differ_from_existing(
+            statistics, existing_in_window, precision=precision
+        ):
+            _LOGGER.debug(
+                "Statistika %s pro %s je beze změny (%d bodů), přeskakuji zápis do Recorderu.",
+                statistic_id,
+                self._ean,
+                len(statistics),
+            )
+            return final_sum
+
         metadata = self._build_metadata(
             statistic_id,
             stat_name,
@@ -605,7 +649,14 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         async_add_external_statistics(self.hass, metadata, statistics)
         return final_sum
 
-    async def _async_update_pnd_statistics(self, signals_data: Any = None) -> None:
+    async def _async_update_pnd_statistics(
+        self,
+        signals_data: Any = None,
+        *,
+        force_fetch_start: datetime | None = None,
+        force_write: bool = False,
+    ) -> None:
+        self._latest_pnd_batch = {}
         statistic_id = self._statistic_id()
         recorder = get_instance(self.hass)
         now = datetime.now(timezone.utc)
@@ -657,6 +708,8 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             minute=0, second=0, microsecond=0
         )
 
+        needs_tariff_backfill = can_split_tariffs and (not has_vt_stats or not has_nt_stats)
+        needs_cost_backfill = can_split_tariffs and not has_all_cost_stats
         if has_existing_data:
             row = last_stats[statistic_id][0]
             # 'start' z get_last_statistics je epoch sekundy (float).
@@ -671,6 +724,32 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.pnd_first_timestamp = await self._async_find_first_statistic_start(
                     recorder, statistic_id, now
                 )
+
+            # Pokud už máme kompletní data až do dnešní lokální půlnoci a
+            # žádná statistika nechybí, není nutné dotazovat MEPAS každou hodinu
+            # (ČEZ publikuje celý včerejší den typicky jednou denně v noci).
+            today_midnight_utc = (
+                dt_util.now()
+                .replace(hour=0, minute=0, second=0, microsecond=0)
+                .astimezone(timezone.utc)
+            )
+            if (
+                force_fetch_start is None
+                and not needs_tariff_backfill
+                and not needs_cost_backfill
+                and self.last_pnd_timestamp >= today_midnight_utc
+                and self._last_pnd_fetch is not None
+                and (now - self._last_pnd_fetch)
+                < timedelta(hours=PND_FRESH_POLL_INTERVAL_HOURS)
+            ):
+                _LOGGER.debug(
+                    "Hodinová data pro %s jsou aktuální do %s (poslední dotaz %s), "
+                    "přeskakuji zbytečný dotaz na MEPAS.",
+                    self._ean,
+                    self.last_pnd_timestamp.isoformat(),
+                    self._last_pnd_fetch.isoformat(),
+                )
+                return
             # Vždy se ohlédneme aspoň PND_TRAILING_SAFETY_DAYS zpátky, ne
             # jen od posledního naimportovaného bodu dál - ČEZ občas
             # doplňuje historii nespolehlivě (den vrátí prázdno, další den
@@ -697,7 +776,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # rozdělené statistiky VT/NT ještě neexistují -> natáhneme jednou
             # 15min historii zpětně od začátku dostupné historie, aby měly VT/NT
             # i náklady stejnou historii a 15min přesnost.
-            if can_split_tariffs and (not has_vt_stats or not has_nt_stats):
+            if needs_tariff_backfill:
                 tariff_backfill_start = (
                     max(self.pnd_first_timestamp, backfill_floor)
                     if self.pnd_first_timestamp is not None
@@ -721,6 +800,9 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 statistic_id,
                 MAX_BACKFILL_YEARS,
             )
+
+        if force_fetch_start is not None:
+            fetch_start = max(force_fetch_start, backfill_floor)
 
         # Zarovnat na začátek celé hodiny, aby u 15min dat nebyly oříznuté
         # první čtvrthodiny a celá hraniční hodina se zbytečně nezahodila.
@@ -780,6 +862,8 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 pnd_max_interval_days_for(used_assembly_code),
                 on_chunk_error=_log_chunk_error,
             )
+
+        self._last_pnd_fetch = now
 
         if not raw_points:
             if chunk_errors:
@@ -866,6 +950,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hourly_buckets,
             unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
             unit_class="energy",
+            force_write=force_write,
         )
         self.last_pnd_timestamp = newest_hour_start + timedelta(hours=1)
         if final_total is not None:
@@ -875,6 +960,10 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if self._is_production:
             return
+
+        self._latest_pnd_batch[STATISTIC_CONSUMPTION] = {
+            ts: round(max(float(val), 0.0), 4) for ts, val in hourly_buckets.items()
+        }
 
         if not can_split_tariffs:
             _LOGGER.debug(
@@ -938,6 +1027,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hourly_vt,
             unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
             unit_class="energy",
+            force_write=force_write,
         )
         await self._async_write_external_statistic(
             recorder,
@@ -946,7 +1036,10 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hourly_nt,
             unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
             unit_class="energy",
+            force_write=force_write,
         )
+        self._latest_pnd_batch[STATISTIC_CONSUMPTION_VT] = dict(hourly_vt)
+        self._latest_pnd_batch[STATISTIC_CONSUMPTION_NT] = dict(hourly_nt)
 
         # Nákladové statistiky VT / NT / celkem podle cen z konfigurace.
         cost_source_vt = dict(hourly_vt)
@@ -989,6 +1082,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             costs_vt,
             unit_of_measurement=currency,
             unit_class=None,
+            force_write=force_write,
         )
         await self._async_write_external_statistic(
             recorder,
@@ -997,6 +1091,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             costs_nt,
             unit_of_measurement=currency,
             unit_class=None,
+            force_write=force_write,
         )
         await self._async_write_external_statistic(
             recorder,
@@ -1005,7 +1100,105 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             costs_total,
             unit_of_measurement=currency,
             unit_class=None,
+            force_write=force_write,
         )
+        self._latest_pnd_batch[STATISTIC_COST_VT] = dict(costs_vt)
+        self._latest_pnd_batch[STATISTIC_COST_NT] = dict(costs_nt)
+        self._latest_pnd_batch[STATISTIC_COST_TOTAL] = dict(costs_total)
+
+    async def async_recalculate_statistics(
+        self,
+        *,
+        days: int = 30,
+        recalculate_costs_only: bool = False,
+    ) -> None:
+        """Zpětně přepočítá statistiky VT/NT a/nebo náklady za posledních `days` dní.
+
+        Volá se ze služby `cez_distribuce.recalculate_statistics` (např. po opravě zadaných
+        cen elektřiny nebo změně HDO signálu v možnostech integrace).
+        """
+        if self._is_production:
+            _LOGGER.info(
+                "Přepočet tarifů/nákladů se pro výrobní EAN %s přeskočí.",
+                self._ean,
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        clamped_days = max(1, min(int(days), 365 * MAX_BACKFILL_YEARS))
+        start_utc = (now - timedelta(days=clamped_days)).replace(
+            minute=0, second=0, microsecond=0
+        )
+        signals_data = (self.data or {}).get(DATA_SIGNALS)
+
+        if recalculate_costs_only:
+            recorder = get_instance(self.hass)
+            vt_stat_id = self.statistic_id_for(STATISTIC_CONSUMPTION_VT)
+            nt_stat_id = self.statistic_id_for(STATISTIC_CONSUMPTION_NT)
+            vt_rows = await self._async_read_stat_rows(recorder, vt_stat_id, start_utc, None)
+            nt_rows = await self._async_read_stat_rows(recorder, nt_stat_id, start_utc, None)
+            hourly_vt = {
+                ts: max(state, 0.0) for ts, state, _ in vt_rows if state is not None
+            }
+            hourly_nt = {
+                ts: max(state, 0.0) for ts, state, _ in nt_rows if state is not None
+            }
+            if not hourly_vt and not hourly_nt:
+                _LOGGER.warning(
+                    "Přepočet nákladů pro %s: za posledních %d dní neexistují "
+                    "statistiky VT/NT.",
+                    self._ean,
+                    clamped_days,
+                )
+                return
+            costs_vt, costs_nt, costs_total = calculate_hourly_costs(
+                hourly_vt, hourly_nt, self._price_vt, self._price_nt
+            )
+            currency = self._currency()
+            await self._async_write_external_statistic(
+                recorder,
+                self.statistic_id_for(STATISTIC_COST_VT),
+                f"ČEZ náklady VT {self._ean}",
+                costs_vt,
+                unit_of_measurement=currency,
+                unit_class=None,
+            )
+            await self._async_write_external_statistic(
+                recorder,
+                self.statistic_id_for(STATISTIC_COST_NT),
+                f"ČEZ náklady NT {self._ean}",
+                costs_nt,
+                unit_of_measurement=currency,
+                unit_class=None,
+            )
+            await self._async_write_external_statistic(
+                recorder,
+                self.statistic_id_for(STATISTIC_COST_TOTAL),
+                f"ČEZ celkové náklady {self._ean}",
+                costs_total,
+                unit_of_measurement=currency,
+                unit_class=None,
+            )
+            self._latest_pnd_batch = {
+                STATISTIC_COST_VT: dict(costs_vt),
+                STATISTIC_COST_NT: dict(costs_nt),
+                STATISTIC_COST_TOTAL: dict(costs_total),
+            }
+        else:
+            if not (self._partner and self._anlage):
+                _LOGGER.warning(
+                    "Přepočet statistik pro %s nelze spustit - chybí metadata partner/anlage.",
+                    self._ean,
+                )
+                return
+            await self._async_update_pnd_statistics(
+                signals_data, force_fetch_start=start_utc
+            )
+            await self._async_update_meter_estimate((self.data or {}).get(DATA_READINGS))
+
+        await self._async_update_monthly_consumption(signals_data)
+        if self.data is not None:
+            self.async_set_updated_data(self.data)
 
     async def _async_find_old_statistic_gap(
         self,
@@ -1085,7 +1278,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Historie odečtů z portálu se aktualizuje jen při odečtu (u
         většiny odběrných míst jednou měsíčně), takže "Stav elektroměru
         VT/NT" může být i několik týdnů starý. Statistiky
-        cez:<ean>_consumption/_vt/_nt ale mají spotřebu až skoro do
+        cez_distribuce:<ean>_consumption/_vt/_nt ale mají spotřebu až skoro do
         současnosti - součet hodinových hodnot od okamžiku odečtu do konce
         importovaných dat je spotřeba od odečtu. Rozdělení na VT/NT bere
         přednostně 15min-přesné statistiky VT/NT, se zálohou na
@@ -1215,6 +1408,220 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             increment,
             self.last_pnd_timestamp.isoformat(),
             base_kwh + increment,
+        )
+
+    async def _async_update_monthly_consumption(self, signals_data: Any = None) -> None:
+        """Spočítá spotřebu a náklady (celkem, VT, NT) za aktuální měsíc, minulý
+        měsíc a poslední kompletní kalendářní den.
+
+        Všechny souhrny se počítají z jednoho dotazu na Recorder překrytého
+        čerstvou dávkou (`_latest_pnd_batch`), takže entity mají přesná čísla
+        okamžitě i při prvním importu bez čekání na vyprázdnění fronty Recorderu.
+        """
+        if self.last_pnd_timestamp is None:
+            self.monthly_consumption = None
+            self.last_day_consumption = None
+            return
+
+        now_local = dt_util.now()
+        month_start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        month_start_utc = month_start_local.astimezone(timezone.utc)
+        prev_month_start_local = (month_start_local - timedelta(days=1)).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
+        prev_month_start_utc = prev_month_start_local.astimezone(timezone.utc)
+        end_utc = self.last_pnd_timestamp
+
+        stat_ids_by_key = {
+            STATISTIC_CONSUMPTION: self.statistic_id_for(STATISTIC_CONSUMPTION),
+            STATISTIC_CONSUMPTION_VT: self.statistic_id_for(STATISTIC_CONSUMPTION_VT),
+            STATISTIC_CONSUMPTION_NT: self.statistic_id_for(STATISTIC_CONSUMPTION_NT),
+            STATISTIC_COST_TOTAL: self.statistic_id_for(STATISTIC_COST_TOTAL),
+            STATISTIC_COST_VT: self.statistic_id_for(STATISTIC_COST_VT),
+            STATISTIC_COST_NT: self.statistic_id_for(STATISTIC_COST_NT),
+        }
+        series: dict[str, dict[datetime, float]] = {key: {} for key in stat_ids_by_key}
+
+        if prev_month_start_utc < end_utc:
+            recorder = get_instance(self.hass)
+            rows_by_id = await recorder.async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                prev_month_start_utc,
+                end_utc,
+                set(stat_ids_by_key.values()),
+                "hour",
+                None,
+                {"state"},
+            )
+            for key, stat_id in stat_ids_by_key.items():
+                target = series[key]
+                for row in (rows_by_id or {}).get(stat_id) or []:
+                    start = _stat_row_start(row)
+                    state = row.get("state")
+                    if start is None or state is None:
+                        continue
+                    if prev_month_start_utc <= start < end_utc:
+                        target[start] = max(float(state), 0.0)
+
+                for start, val in self._latest_pnd_batch.get(key, {}).items():
+                    if prev_month_start_utc <= start < end_utc:
+                        target[start] = max(float(val), 0.0)
+
+        lookup = ScheduleLookup(self._hdo_history or {})
+        is_single_tariff = (
+            not self._hdo_signal
+            and isinstance(signals_data, dict)
+            and not (signals_data.get("signals") or [])
+        )
+        has_tariff_support = (
+            bool(series[STATISTIC_CONSUMPTION_VT])
+            or bool(series[STATISTIC_CONSUMPTION_NT])
+            or bool(lookup)
+            or is_single_tariff
+        )
+
+        def _summarize(
+            period_start_utc: datetime,
+            period_end_utc: datetime,
+            *,
+            allow_empty_zero: bool,
+        ) -> tuple[
+            int,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+            float | None,
+        ]:
+            total_map = {
+                ts: val
+                for ts, val in series[STATISTIC_CONSUMPTION].items()
+                if period_start_utc <= ts < period_end_utc
+            }
+            hours_count = len(total_map)
+            if hours_count == 0:
+                if not allow_empty_zero:
+                    return 0, None, None, None, None, None, None
+                z = 0.0 if has_tariff_support else None
+                return 0, 0.0, z, z, z, z, z
+
+            vt_map = series[STATISTIC_CONSUMPTION_VT]
+            nt_map = series[STATISTIC_CONSUMPTION_NT]
+            cost_vt_map = series[STATISTIC_COST_VT]
+            cost_nt_map = series[STATISTIC_COST_NT]
+            cost_total_map = series[STATISTIC_COST_TOTAL]
+
+            total_kwh = round(sum(total_map.values()), 3)
+            vt_kwh: float | None = None
+            nt_kwh: float | None = None
+            if all(ts in vt_map and ts in nt_map for ts in total_map):
+                raw_nt = sum(nt_map[ts] for ts in total_map)
+                nt_kwh = min(round(raw_nt, 3), total_kwh)
+                vt_kwh = round(max(total_kwh - nt_kwh, 0.0), 3)
+            elif lookup:
+                split = split_hourly_consumption(
+                    sorted(total_map.items()), lookup, dt_util.as_local
+                )
+                if split is not None and split.hours > 0:
+                    nt_kwh = min(round(split.nt_kwh, 3), total_kwh)
+                    vt_kwh = round(max(total_kwh - nt_kwh, 0.0), 3)
+            elif is_single_tariff:
+                vt_kwh = total_kwh
+                nt_kwh = 0.0
+
+            cost_vt: float | None = None
+            cost_nt: float | None = None
+            cost_total: float | None = None
+            if all(
+                ts in cost_vt_map and ts in cost_nt_map and ts in cost_total_map
+                for ts in total_map
+            ):
+                cost_vt = round(sum(cost_vt_map[ts] for ts in total_map), 2)
+                cost_nt = round(sum(cost_nt_map[ts] for ts in total_map), 2)
+                cost_total = round(cost_vt + cost_nt, 2)
+            elif vt_kwh is not None and nt_kwh is not None:
+                cost_vt = round(vt_kwh * self._price_vt, 2)
+                cost_nt = round(nt_kwh * self._price_nt, 2)
+                cost_total = round(cost_vt + cost_nt, 2)
+
+            return hours_count, total_kwh, vt_kwh, nt_kwh, cost_total, cost_vt, cost_nt
+
+        cur_h, cur_tot, cur_vt, cur_nt, cur_c_tot, cur_c_vt, cur_c_nt = _summarize(
+            month_start_utc, end_utc, allow_empty_zero=True
+        )
+        _, prev_tot, prev_vt, prev_nt, prev_c_tot, prev_c_vt, prev_c_nt = _summarize(
+            prev_month_start_utc, min(month_start_utc, end_utc), allow_empty_zero=False
+        )
+
+        self.monthly_consumption = {
+            "month": month_start_local.strftime("%Y-%m"),
+            "month_start": month_start_local,
+            "data_until": end_utc,
+            "hours": cur_h,
+            "total_kwh": cur_tot,
+            "vt_kwh": cur_vt,
+            "nt_kwh": cur_nt,
+            "cost_total": cur_c_tot,
+            "cost_vt": cur_c_vt,
+            "cost_nt": cur_c_nt,
+            "currency": self._currency(),
+            "prev_month": prev_month_start_local.strftime("%Y-%m"),
+            "prev_total_kwh": prev_tot,
+            "prev_vt_kwh": prev_vt,
+            "prev_nt_kwh": prev_nt,
+            "prev_cost_total": prev_c_tot,
+            "prev_cost_vt": prev_c_vt,
+            "prev_cost_nt": prev_c_nt,
+        }
+
+        # Poslední uzavřený kalendářní den v lokální zóně HA (všechny jeho hodiny
+        # jsou <= end_utc). Používá stejný už načtený `series` bez dalšího DB dotazu.
+        local_tz = month_start_local.tzinfo
+        candidate_days = sorted(
+            {dt_util.as_local(ts).date() for ts in series[STATISTIC_CONSUMPTION]},
+            reverse=True,
+        )
+        last_day_info: dict[str, Any] | None = None
+        for day in candidate_days:
+            day_start_local = datetime(
+                day.year, day.month, day.day, 0, 0, 0, tzinfo=local_tz
+            )
+            next_day = day + timedelta(days=1)
+            day_end_local = datetime(
+                next_day.year, next_day.month, next_day.day, 0, 0, 0, tzinfo=local_tz
+            )
+            day_start_utc = day_start_local.astimezone(timezone.utc)
+            day_end_utc = day_end_local.astimezone(timezone.utc)
+            if day_end_utc <= end_utc:
+                d_h, d_tot, d_vt, d_nt, d_c_tot, d_c_vt, d_c_nt = _summarize(
+                    day_start_utc, day_end_utc, allow_empty_zero=False
+                )
+                if d_h > 0 and d_tot is not None:
+                    last_day_info = {
+                        "date": day.isoformat(),
+                        "day_start": day_start_local,
+                        "data_until": day_end_utc,
+                        "hours": d_h,
+                        "total_kwh": d_tot,
+                        "vt_kwh": d_vt,
+                        "nt_kwh": d_nt,
+                        "cost_total": d_c_tot,
+                        "cost_vt": d_c_vt,
+                        "cost_nt": d_c_nt,
+                        "currency": self._currency(),
+                    }
+                    break
+        self.last_day_consumption = last_day_info
+        _LOGGER.debug(
+            "Měsíční spotřeba (%s, %d h do %s): celkem=%.3f kWh, VT=%s kWh, NT=%s kWh.",
+            self.monthly_consumption["month"],
+            cur_h,
+            end_utc.isoformat(),
+            cur_tot or 0.0,
+            f"{cur_vt:.3f}" if cur_vt is not None else "-",
+            f"{cur_nt:.3f}" if cur_nt is not None else "-",
         )
 
     async def _async_update_hdo_history(self, signals_data: Any) -> None:

@@ -322,6 +322,46 @@ def build_statistic_rows(
     return rows, final_sum
 
 
+def rows_differ_from_existing(
+    rows: list[dict[str, Any]],
+    existing_in_window: list[tuple[datetime, float | None, float | None]],
+    *,
+    precision: int = 4,
+) -> bool:
+    """Vrátí True, pokud by zápis `rows` skutečně změnil existující řádky v DB.
+
+    Slouží ke snížení zbytečných zápisů do HA Recorderu při opakovaném
+    přeimportovacím okně (`PND_TRAILING_SAFETY_DAYS`), kdy ČEZ za posledních
+    několik dní nic nezměnil ani nedoplnil.
+    """
+    if not rows:
+        return False
+    if len(rows) != len(existing_in_window):
+        return True
+
+    tol = 10 ** (-precision - 1)
+    existing_map = {
+        ts: (state, total) for ts, state, total in existing_in_window
+    }
+    if len(existing_map) != len(rows):
+        return True
+
+    for row in rows:
+        ts = row["start"]
+        if ts not in existing_map:
+            return True
+        ex_state, ex_sum = existing_map[ts]
+        new_state = row.get("state")
+        new_sum = row.get("sum")
+        if new_state is not None:
+            if ex_state is None or abs(float(new_state) - float(ex_state)) > tol:
+                return True
+        if new_sum is not None:
+            if ex_sum is None or abs(float(new_sum) - float(ex_sum)) > tol:
+                return True
+    return False
+
+
 async def fetch_pnd_chunked(
     client: Any,
     partner: str,

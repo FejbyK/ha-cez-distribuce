@@ -8,7 +8,7 @@ body:
       value: |
         Máte dotaz? Rádi vám pomůžeme!
 
-        **Tip:** Nejdříve zkontrolujte [dokumentaci](https://github.com/MattXcz/CEZ#readme).
+        **Tip:** Nejdříve zkontrolujte [dokumentaci](https://github.com/FejbyK/CEZ#readme).
 
   - type: textarea
     id: question
@@ -32,8 +32,8 @@ body:
     id: version
     attributes:
       label: Verze integrace
-      description: Jakou verzi ČEZ HDO používáte?
-      placeholder: "např. 2.2.0"
+      description: Jakou verzi ČEZ Distribuce používáte?
+      placeholder: "např. 1.0.0"
 
   - type: textarea
     id: config

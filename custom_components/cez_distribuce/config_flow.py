@@ -10,7 +10,6 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import (
     CezAuthError,
@@ -33,6 +32,7 @@ from .const import (
     CONF_PRICE_NT,
     CONF_PRICE_VT,
     CONF_USERNAME,
+    DATA_SIGNALS,
     DEFAULT_PRICE_NT,
     DEFAULT_PRICE_VT,
     DOMAIN,
@@ -102,6 +102,13 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             _LOGGER.exception("Neočekávaná chyba při přihlašování", exc_info=err)
         return "cannot_connect"
 
+    async def _async_close_client(self) -> None:
+        """Uzavře HTTP session sdíleného klienta průvodce."""
+        if self._client is not None:
+            client = self._client
+            self._client = None
+            await client.async_close()
+
     async def _async_get_client(self) -> CezDistribuceApiClient:
         """Přihlásí se nejvýše jednou a vrací klienta sdíleného pro celý flow."""
         if self._client is None:
@@ -109,9 +116,12 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             client = CezDistribuceApiClient(
                 username=self._username,
                 password=self._password,
-                session=async_get_clientsession(self.hass),
             )
-            await client.login()
+            try:
+                await client.login()
+            except Exception:
+                await client.async_close()
+                raise
             self._client = client
         return self._client
 
@@ -129,7 +139,7 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._username = user_input[CONF_USERNAME]
             self._password = user_input[CONF_PASSWORD]
             # Nové odeslání formuláře = možná jiné údaje, přihlásit znovu.
-            self._client = None
+            await self._async_close_client()
 
             try:
                 client = await self._async_get_client()
@@ -272,19 +282,18 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         entry = self._get_reauth_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
-            client = CezDistribuceApiClient(
+            async with CezDistribuceApiClient(
                 username=entry.data[CONF_USERNAME],
                 password=user_input[CONF_PASSWORD],
-                session=async_get_clientsession(self.hass),
-            )
-            try:
-                await client.login()
-            except Exception as err:  # noqa: BLE001
-                errors["base"] = self._login_error_key(err)
-            else:
-                return self.async_update_reload_and_abort(
-                    entry, data_updates={CONF_PASSWORD: user_input[CONF_PASSWORD]}
-                )
+            ) as client:
+                try:
+                    await client.login()
+                except Exception as err:  # noqa: BLE001
+                    errors["base"] = self._login_error_key(err)
+                else:
+                    return self.async_update_reload_and_abort(
+                        entry, data_updates={CONF_PASSWORD: user_input[CONF_PASSWORD]}
+                    )
         return self.async_show_form(
             step_id="reauth_confirm",
             data_schema=vol.Schema({vol.Required(CONF_PASSWORD): str}),
@@ -303,37 +312,36 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
-            client = CezDistribuceApiClient(
-                username=user_input[CONF_USERNAME],
-                password=user_input[CONF_PASSWORD],
-                session=async_get_clientsession(self.hass),
-            )
             data_updates: dict[str, Any] = {
                 CONF_USERNAME: user_input[CONF_USERNAME],
                 CONF_PASSWORD: user_input[CONF_PASSWORD],
             }
-            try:
-                await client.login()
-                environment = None
-                if client.environment_options:
-                    environment = await client.find_environment_for_supply_point(
-                        entry.data.get("uid", ""), entry.data[CONF_EAN]
-                    )
-                    if environment is None:
+            environment = None
+            async with CezDistribuceApiClient(
+                username=user_input[CONF_USERNAME],
+                password=user_input[CONF_PASSWORD],
+            ) as client:
+                try:
+                    await client.login()
+                    if client.environment_options:
+                        environment = await client.find_environment_for_supply_point(
+                            entry.data.get("uid", ""), entry.data[CONF_EAN]
+                        )
+                        if environment is None:
+                            errors["base"] = "supply_point_not_found"
+                    elif not any(
+                        p.get("ean") == entry.data[CONF_EAN]
+                        for p in extract_supply_points(await client.get_supply_points())
+                    ):
                         errors["base"] = "supply_point_not_found"
-                elif not any(
-                    p.get("ean") == entry.data[CONF_EAN]
-                    for p in extract_supply_points(await client.get_supply_points())
-                ):
-                    errors["base"] = "supply_point_not_found"
-                if not errors:
-                    # Portál může pro stejný EAN časem vrátit jiné UID
-                    # (issue #43) - překonfigurování ho rovnou obnoví.
-                    new_uid = await client.resolve_supply_point_uid(entry.data[CONF_EAN])
-                    if new_uid and new_uid != entry.data.get("uid"):
-                        data_updates["uid"] = new_uid
-            except Exception as err:  # noqa: BLE001
-                errors["base"] = self._login_error_key(err)
+                    if not errors:
+                        # Portál může pro stejný EAN časem vrátit jiné UID
+                        # (issue #43) - překonfigurování ho rovnou obnoví.
+                        new_uid = await client.resolve_supply_point_uid(entry.data[CONF_EAN])
+                        if new_uid and new_uid != entry.data.get("uid"):
+                            data_updates["uid"] = new_uid
+                except Exception as err:  # noqa: BLE001
+                    errors["base"] = self._login_error_key(err)
             if not errors:
                 if environment:
                     data_updates[CONF_PORTAL_ENVIRONMENT] = environment[0]
@@ -442,8 +450,11 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             bool(title),
             bool(self._selected_ean),
         )
-        await self.async_set_unique_id(self._selected_ean)
-        self._abort_if_unique_id_configured()
+        try:
+            await self.async_set_unique_id(self._selected_ean)
+            self._abort_if_unique_id_configured()
+        finally:
+            await self._async_close_client()
         return self.async_create_entry(
             title=title,
             data={
@@ -470,40 +481,72 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
 
 class CezOptionsFlow(config_entries.OptionsFlowWithReload):
-    """Změna cen VT/NT bez nového přidání odběrného místa (issue #44).
+    """Změna cen VT/NT a HDO signálu bez nového přidání odběrného místa (issue #44).
 
-    Ceny se ukládají do entry.options; senzor „Aktuální cena“ je čte
-    přednostně odtud, se zálohou na entry.data (ceny zadané při přidání).
+    Hodnoty se ukládají do entry.options; koordinátor i senzory je čtou
+    přednostně odtud, se zálohou na entry.data (hodnoty zadané při přidání).
     OptionsFlowWithReload po uložení integraci sám znovu načte."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        if user_input is not None:
-            return self.async_create_entry(
-                data={
-                    CONF_PRICE_VT: user_input[CONF_PRICE_VT],
-                    CONF_PRICE_NT: user_input[CONF_PRICE_NT],
-                }
-            )
-
         entry = self.config_entry
+        current_hdo = entry.options.get(
+            CONF_HDO_SIGNAL, entry.data.get(CONF_HDO_SIGNAL, "")
+        )
+        if user_input is not None:
+            options_data: dict[str, Any] = {
+                CONF_PRICE_VT: user_input[CONF_PRICE_VT],
+                CONF_PRICE_NT: user_input[CONF_PRICE_NT],
+            }
+            if CONF_HDO_SIGNAL in user_input:
+                options_data[CONF_HDO_SIGNAL] = user_input[CONF_HDO_SIGNAL]
+            elif current_hdo:
+                options_data[CONF_HDO_SIGNAL] = current_hdo
+            return self.async_create_entry(data=options_data)
+
         current_vt = entry.options.get(
             CONF_PRICE_VT, entry.data.get(CONF_PRICE_VT, DEFAULT_PRICE_VT)
         )
         current_nt = entry.options.get(
             CONF_PRICE_NT, entry.data.get(CONF_PRICE_NT, DEFAULT_PRICE_NT)
         )
+
+        available_signals: list[str] = []
+        coordinator = (self.hass.data.get(DOMAIN) or {}).get(entry.entry_id)
+        signals_data = (
+            (coordinator.data or {}).get(DATA_SIGNALS)
+            if coordinator is not None
+            else None
+        )
+        if isinstance(signals_data, dict):
+            seen: set[str] = set()
+            for item in signals_data.get("signals") or []:
+                if not isinstance(item, dict):
+                    continue
+                code = str(item.get("signal") or "").strip()
+                if code and code not in seen:
+                    seen.add(code)
+                    available_signals.append(code)
+        if current_hdo and current_hdo not in available_signals:
+            available_signals.insert(0, current_hdo)
+
+        schema_fields: dict[Any, Any] = {}
+        if available_signals:
+            schema_fields[
+                vol.Required(
+                    CONF_HDO_SIGNAL,
+                    default=current_hdo or available_signals[0],
+                )
+            ] = vol.In({s: s for s in available_signals})
+        schema_fields[
+            vol.Required(CONF_PRICE_VT, default=float(current_vt))
+        ] = vol.All(vol.Coerce(float), vol.Range(min=0))
+        schema_fields[
+            vol.Required(CONF_PRICE_NT, default=float(current_nt))
+        ] = vol.All(vol.Coerce(float), vol.Range(min=0))
+
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
-                {
-                    vol.Required(CONF_PRICE_VT, default=float(current_vt)): vol.All(
-                        vol.Coerce(float), vol.Range(min=0)
-                    ),
-                    vol.Required(CONF_PRICE_NT, default=float(current_nt)): vol.All(
-                        vol.Coerce(float), vol.Range(min=0)
-                    ),
-                }
-            ),
+            data_schema=vol.Schema(schema_fields),
         )
