@@ -22,31 +22,31 @@
 <table>
   <tr>
     <td width="50%" valign="top">
-      <strong>⚡ 15min rozpad VT / NT</strong><br />
+      <strong>15min rozpad VT / NT</strong><br />
       Stahuje čtvrthodinový profil z chytrého elektroměru, dělí ho podle skutečného HDO a zapisuje statistiky do <strong>Energy dashboardu</strong>.
     </td>
     <td width="50%" valign="top">
-      <strong>💰 Měsíční a denní náklady</strong><br />
+      <strong>Měsíční a denní náklady</strong><br />
       Přehled spotřeby i ceny za aktuální a minulý měsíc i poslední uzavřený den (celkem, VT, NT).
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
-      <strong>🕒 HDO, tarify a odhady</strong><br />
+      <strong>HDO, tarify a odhady</strong><br />
       Aktuální tarif, časy spínání (i přes půlnoc), aktuální cena za kWh a odhad stavu elektroměru.
     </td>
     <td width="50%" valign="top">
-      <strong>☀️ FVE a mikrozdroje</strong><br />
+      <strong>FVE a mikrozdroje</strong><br />
       Samostatná statistika dodávky do sítě bez zbytečných HDO senzorů. U jednotarifu se HDO entity skryjí automaticky.
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
-      <strong>🏠 Více EAN i prostředí</strong><br />
+      <strong>Více EAN i prostředí</strong><br />
       Podpora více odběrných míst i účtů kombinujících <strong>Domácnost</strong> a <strong>Podnikatel</strong>.
     </td>
     <td width="50%" valign="top">
-      <strong>🚀 Šetrný provoz</strong><br />
+      <strong>Šetrný provoz</strong><br />
       Samostatná doména <code>cez_distribuce</code>, sdílená spojení, 4h dotazy po doručení včerejška a žádné zbytečné zápisy do Recorderu.
     </td>
   </tr>
@@ -97,7 +97,7 @@
 *(Přesná ID najdete v atributu `statistiky` entity `sensor.hodinova_data_spotreby_k`. Hodinová/15min data vyžadují chytrý elektroměr s dálkovým odečtem.)*
 
 <details>
-<summary>🔄 Zpětný přepočet statistik po změně cen nebo HDO signálu</summary>
+<summary>Zpětný přepočet statistik po změně cen nebo HDO signálu</summary>
 
 V **Nástroje pro vývojáře → Akce** spusťte:
 
@@ -120,7 +120,7 @@ data:
 ## Přehled entit
 
 <details>
-<summary>📊 Zobrazit kompletní seznam vytvářených senzorů</summary>
+<summary>Zobrazit kompletní seznam vytvářených senzorů</summary>
 
 ### Spotřeba a náklady (chytrý elektroměr)
 
@@ -153,7 +153,7 @@ data:
 </details>
 
 <details>
-<summary>🛠️ Řešení problémů, intervaly a diagnostika</summary>
+<summary>Řešení problémů, intervaly a diagnostika</summary>
 
 - **Intervaly**: portál (HDO, odečty, odstávky) každou hodinu; MEPAS po doručení včerejška každé 4 hodiny + denní kontrola děr za 62 dní.
 - **Historie HDO**: integrace ukládá denní plány až 400 dní zpět a počítá přesný poměr minut NT/VT v každé čtvrthodině (včetně DST).
