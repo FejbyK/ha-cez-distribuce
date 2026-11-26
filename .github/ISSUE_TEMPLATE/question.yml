@@ -8,7 +8,7 @@ body:
       value: |
         Máte dotaz? Rádi vám pomůžeme!
 
-        **Tip:** Nejdříve zkontrolujte [dokumentaci](https://github.com/FejbyK/CEZ#readme).
+        **Tip:** Nejdříve zkontrolujte [dokumentaci](https://github.com/FejbyK/ha-cez-distribuce#readme).
 
   - type: textarea
     id: question

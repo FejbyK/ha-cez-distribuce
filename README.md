@@ -8,12 +8,12 @@ Integrace pro **Home Assistant** napojená na portál [ČEZ Distribuce](https://
 Přináší sledování **HDO**, **odečtů**, **odstávek** a u chytrých elektroměrů **15minutový rozpad spotřeby na VT/NT**, náklady a dlouhodobé statistiky připravené přímo pro **Energy dashboard**.
 
 [![HACS Custom](https://img.shields.io/badge/HACS-Custom-F05A22?style=for-the-badge&labelColor=1F1F1F&logoColor=F05A22)](https://github.com/hacs/integration)
-[![HACS Validation](https://img.shields.io/github/actions/workflow/status/FejbyK/CEZ/hacs.yaml?branch=main&style=for-the-badge&label=HACS%20Check&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/CEZ/actions/workflows/hacs.yaml)
-[![Code Quality](https://img.shields.io/github/actions/workflow/status/FejbyK/CEZ/quality.yaml?branch=main&style=for-the-badge&label=Tests%20%26%20Quality&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/CEZ/actions/workflows/quality.yaml)
-[![Hassfest](https://img.shields.io/github/actions/workflow/status/FejbyK/CEZ/hassfest.yaml?branch=main&style=for-the-badge&label=Hassfest&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/CEZ/actions/workflows/hassfest.yaml)
-[![Licence MIT](https://img.shields.io/badge/License-MIT-F05A22?style=for-the-badge&labelColor=1F1F1F)](LICENSE)
+[![HACS Validation](https://img.shields.io/github/actions/workflow/status/FejbyK/ha-cez-distribuce/hacs.yaml?branch=main&style=for-the-badge&label=HACS%20Check&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/ha-cez-distribuce/actions/workflows/hacs.yaml)
+[![Code Quality](https://img.shields.io/github/actions/workflow/status/FejbyK/ha-cez-distribuce/quality.yaml?branch=main&style=for-the-badge&label=Tests%20%26%20Quality&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/ha-cez-distribuce/actions/workflows/quality.yaml)
+[![Hassfest](https://img.shields.io/github/actions/workflow/status/FejbyK/ha-cez-distribuce/hassfest.yaml?branch=main&style=for-the-badge&label=Hassfest&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/ha-cez-distribuce/actions/workflows/hassfest.yaml)
+[![Licence GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-F05A22?style=for-the-badge&labelColor=1F1F1F)](LICENSE)
 
-[![Otevřít repozitář v HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?category=Integration&owner=FejbyK&repository=CEZ)
+[![Otevřít repozitář v HACS](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?category=Integration&owner=FejbyK&repository=ha-cez-distribuce)
 
 </div>
 
@@ -34,7 +34,7 @@ Přináší sledování **HDO**, **odečtů**, **odstávek** a u chytrých elekt
 
 ### Přes HACS (doporučeno)
 
-1. Klikněte na tlačítko **Otevřít repozitář v HACS** výše (nebo **HACS → ⋮ → Vlastní repozitáře** → `https://github.com/FejbyK/CEZ`, kategorie **Integrace**).
+1. Klikněte na tlačítko **Otevřít repozitář v HACS** výše (nebo **HACS → ⋮ → Vlastní repozitáře** → `https://github.com/FejbyK/ha-cez-distribuce`, kategorie **Integrace**).
 2. Nainstalujte **ČEZ Distribuce** a restartujte Home Assistant.
 3. Přidejte integraci v **Nastavení → Zařízení a služby → Přidat integraci → ČEZ Distribuce**.
 
@@ -185,4 +185,4 @@ python3 -m unittest discover -s tests -v
 
 - Integrace využívá neoficiální API portálu ČEZ Distribuce a aplikace Proud – struktura odpovědí se může bez upozornění změnit.
 - Vychází z projektu [MattXcz/CEZ](https://github.com/MattXcz/CEZ), rozpad spotřeby na VT/NT a nákladové statistiky jsou inspirovány [igracek/HACS_CEZD_PND](https://github.com/igracek/HACS_CEZD_PND), za původní reverzní analýzu aplikace Proud patří poděkování Romanu Vohradníkovi.
-- Šířeno pod licencí [MIT](LICENSE).
+- Šířeno pod licencí [GNU GPL-3.0](LICENSE) (původní MIT oznámení viz [NOTICE](NOTICE)).

@@ -6,9 +6,9 @@
   "codeowners": ["@FejbyK"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/FejbyK/CEZ",
+  "documentation": "https://github.com/FejbyK/ha-cez-distribuce",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/FejbyK/CEZ/issues",
+  "issue_tracker": "https://github.com/FejbyK/ha-cez-distribuce/issues",
   "quality_scale": "silver",
   "requirements": [],
   "version": "1.0.0"
