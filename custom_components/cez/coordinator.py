@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 from homeassistant.components.recorder import get_instance
@@ -36,43 +36,59 @@ from .const import (
     DATA_OUTAGES,
     DATA_READINGS,
     DATA_SIGNALS,
+    DEFAULT_PRICE_NT,
+    DEFAULT_PRICE_VT,
     DOMAIN,
-    MAX_PND_INTERVAL_DAYS,
     OM_TYPE_CONSUMPTION,
     OM_TYPES_PRODUCTION,
+    PND_ASSEMBLY_15MIN,
     PND_ASSEMBLY_DAILY_REGISTERS,
-    PND_INTERVAL_MINUTES_BY_ASSEMBLY,
-    PND_KNOWN_ASSEMBLY_CODES,
+    PND_ASSEMBLY_HOURLY,
     PND_GAP_REPAIR_INTERVAL_HOURS,
     PND_GAP_SCAN_DAYS,
     PND_GAP_ZERO_RUN_HOURS,
+    PND_INTERVAL_MINUTES_BY_ASSEMBLY,
+    PND_KNOWN_ASSEMBLY_CODES,
     PND_TRAILING_SAFETY_DAYS,
+    STATISTIC_CONSUMPTION,
+    STATISTIC_CONSUMPTION_NT,
+    STATISTIC_CONSUMPTION_VT,
+    STATISTIC_COST_NT,
+    STATISTIC_COST_TOTAL,
+    STATISTIC_COST_VT,
+    STATISTIC_PRODUCTION,
     UPDATE_INTERVAL_SECONDS,
     pnd_assembly_code_for,
+    pnd_max_interval_days_for,
 )
 from .hdo_split import (
     SOURCE_KNOWN,
     SOURCE_NEAREST,
     SOURCE_WEEKDAY,
     ScheduleLookup,
+    calculate_hourly_costs,
+    count_schedule_sources,
     extract_signal_schedules,
     merge_schedule_history,
     split_hourly_consumption,
+    split_interval_consumption,
 )
 from .pnd_processing import (
+    build_statistic_rows,
     fetch_pnd_chunked,
     find_statistic_gaps,
     infer_interval_minutes,
-    process_pnd_response,
+    process_pnd_points,
     reading_baseline,
     reading_registers,
+    summarize_pnd_points,
 )
 
 _LOGGER = logging.getLogger(__name__)
 
 # Úložiště zapamatovaných plánů HDO (issue #49) - portál vrací plán jen
-# pro dnešek a pár dní dopředu, pro rozdělení spotřeby od posledního
-# odečtu na VT/NT potřebujeme i plány dní, které už portál neukazuje.
+# pro dnešek a pár dní dopředu, pro rozdělení spotřeby na VT/NT potřebujeme
+# i plány dní, které už portál neukazuje.
 HDO_HISTORY_STORAGE_VERSION = 1
 
 # Jak daleko do minulosti se má integrace pokusit dohledat data při úplně
@@ -96,10 +112,14 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         anlage: str = "",
         om_type: str = OM_TYPE_CONSUMPTION,
         hdo_signal: str = "",
+        price_vt: float = DEFAULT_PRICE_VT,
+        price_nt: float = DEFAULT_PRICE_NT,
         on_uid_changed: Callable[[str], None] | None = None,
     ) -> None:
         self._client = client
         self._hdo_signal = hdo_signal or ""
+        self._price_vt = float(price_vt)
+        self._price_nt = float(price_nt)
         # Plány HDO po dnech {'YYYY-MM-DD': casy} (issue #49) - načtou se
         # líně při první aktualizaci, viz _async_update_hdo_history.
         self._hdo_store: Store[dict[str, Any]] = Store(
@@ -131,7 +151,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.last_successful_update: datetime | None = None
 
         # Časové razítko "data máme uložená až do..." (konec poslední
-        # úspěšně naimportované hodiny hodinové spotřeby) - čte ho
+        # úspěšně naimportované hodiny spotřeby) - čte ho
         # CezConsumptionFreshnessSensor v sensor.py. None dokud neproběhne
         # první úspěšný import (nebo pokud tahle instalace 'partner'/'anlage'
         # vůbec nemá - viz __init__.py).
@@ -270,7 +290,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # data, last_pnd_timestamp jen čerstvost hodinové spotřeby.
         if self._partner and self._anlage:
             try:
-                await self._async_update_pnd_statistics()
+                await self._async_update_pnd_statistics(merged_data.get(DATA_SIGNALS))
             except Exception:  # noqa: BLE001
                 _LOGGER.exception(
                     "Import hodinové spotřeby (pnd/data) selhal "
@@ -353,24 +373,239 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return result
 
     # ------------------------------------------------------------------
-    # Hodinová/15min spotřeba (appka Proud, MEPAS/AWS Gateway) jako
-    # externí dlouhodobá statistika, stejný princip jako u integrace
-    # vodoměru.
+    # 15min/hodinová spotřeba (appka Proud, MEPAS/AWS Gateway) jako
+    # externí dlouhodobé statistiky pro HA Energy Dashboard:
+    # - celková spotřeba (cez:<ean>_consumption)
+    # - spotřeba VT / NT podle plánu HDO (cez:<ean>_consumption_vt / _nt)
+    # - náklady VT / NT / celkem (cez:<ean>_cost_vt / _nt / _total)
+    # - dodávka do sítě u FVE (cez:<ean>_production)
     # ------------------------------------------------------------------
+
+    def statistic_id_for(self, suffix: str) -> str:
+        """ID externí dlouhodobé statistiky pro danou příponu."""
+        # DŮLEŽITÉ: statistic_id smí obsahovat jen [a-z0-9_] za dvojtečkou.
+        safe_id = re.sub(r"[^a-z0-9_]", "_", self._ean.lower())
+        return f"{DOMAIN}:{safe_id}_{suffix}"
 
     @property
     def statistic_id(self) -> str:
-        """ID dlouhodobé statistiky hodinových dat tohoto odběrného místa
+        """ID hlavní dlouhodobé statistiky tohoto odběrného místa
         ("cez:<ean>_consumption" / "cez:<ean>_production")."""
         return self._statistic_id()
 
-    def _statistic_id(self) -> str:
-        # DŮLEŽITÉ: statistic_id smí obsahovat jen [a-z0-9_] za dvojtečkou.
-        safe_id = re.sub(r"[^a-z0-9_]", "_", self._ean.lower())
-        suffix = "production" if self._is_production else "consumption"
-        return f"{DOMAIN}:{safe_id}_{suffix}"
+    @property
+    def statistic_ids(self) -> dict[str, str]:
+        """Mapa všech externích statistik vytvářených pro toto odběrné místo."""
+        if self._is_production:
+            return {STATISTIC_PRODUCTION: self.statistic_id_for(STATISTIC_PRODUCTION)}
+        return {
+            STATISTIC_CONSUMPTION: self.statistic_id_for(STATISTIC_CONSUMPTION),
+            STATISTIC_CONSUMPTION_VT: self.statistic_id_for(STATISTIC_CONSUMPTION_VT),
+            STATISTIC_CONSUMPTION_NT: self.statistic_id_for(STATISTIC_CONSUMPTION_NT),
+            STATISTIC_COST_VT: self.statistic_id_for(STATISTIC_COST_VT),
+            STATISTIC_COST_NT: self.statistic_id_for(STATISTIC_COST_NT),
+            STATISTIC_COST_TOTAL: self.statistic_id_for(STATISTIC_COST_TOTAL),
+        }
 
-    async def _async_update_pnd_statistics(self) -> None:
+    def _statistic_id(self) -> str:
+        suffix = STATISTIC_PRODUCTION if self._is_production else STATISTIC_CONSUMPTION
+        return self.statistic_id_for(suffix)
+
+    def _currency(self) -> str:
+        """Měna nastavená v Home Assistantu pro nákladové statistiky."""
+        currency = getattr(getattr(self.hass, "config", None), "currency", None)
+        return str(currency or "CZK").upper()
+
+    def _build_metadata(
+        self,
+        statistic_id: str,
+        stat_name: str,
+        *,
+        unit_of_measurement: str | None,
+        unit_class: str | None,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "has_mean": False,
+            "has_sum": True,
+            "name": stat_name,
+            "source": DOMAIN,
+            "statistic_id": statistic_id,
+            "unit_of_measurement": unit_of_measurement,
+            # Vyžadováno novějšími verzemi HA (recorder od podzimu 2025 bez
+            # tohohle pole import statistik odmítá). Pro měnu je None.
+            "unit_class": unit_class,
+        }
+        if StatisticMeanType is not None:
+            # Nahrazuje deprecated has_mean bool - HA 2026.11+ ho bude
+            # vyžadovat povinně, se starším has_mean ale zatím funguje
+            # obojí zároveň.
+            metadata["mean_type"] = StatisticMeanType.NONE
+        return metadata
+
+    async def _async_has_statistic(self, recorder: Any, statistic_id: str) -> bool:
+        """Zjistí, zda už v Recorderu existuje alespoň jeden řádek statistiky."""
+        last_stats = await recorder.async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, True, {"start"}
+        )
+        return bool(last_stats and last_stats.get(statistic_id))
+
+    async def _async_get_baseline_sum(
+        self, recorder: Any, statistic_id: str, before_time: datetime
+    ) -> float:
+        """Kumulativní `sum` statistiky těsně před `before_time` (0.0 když nic není).
+
+        Rychlá cesta čte jedinou předchozí hodinu; pokud tam je mezera, spadne
+        na měsíční dotaz a poslední hodinu v nalezeném měsíci, takže nikdy
+        nespadne chybně na 0.0 ani u starších děr.
+        """
+        prior = await recorder.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            before_time - timedelta(hours=1),
+            before_time,
+            {statistic_id},
+            "hour",
+            None,
+            {"sum"},
+        )
+        rows = prior.get(statistic_id) if prior else None
+        if rows and rows[-1].get("sum") is not None:
+            return float(rows[-1]["sum"])
+
+        epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+        end_before = before_time - timedelta(microseconds=1)
+        if end_before <= epoch:
+            return 0.0
+
+        monthly = await recorder.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            epoch,
+            end_before,
+            {statistic_id},
+            "month",
+            None,
+            {"sum"},
+        )
+        month_rows = monthly.get(statistic_id) if monthly else None
+        if not month_rows:
+            return 0.0
+        last_month_start = _stat_row_start(month_rows[-1])
+        if last_month_start is not None:
+            hourly = await recorder.async_add_executor_job(
+                statistics_during_period,
+                self.hass,
+                last_month_start,
+                end_before,
+                {statistic_id},
+                "hour",
+                None,
+                {"sum"},
+            )
+            hour_rows = hourly.get(statistic_id) if hourly else None
+            if hour_rows and hour_rows[-1].get("sum") is not None:
+                return float(hour_rows[-1]["sum"])
+        if month_rows[-1].get("sum") is not None:
+            return float(month_rows[-1]["sum"])
+        return 0.0
+
+    async def _async_read_stat_rows(
+        self,
+        recorder: Any,
+        statistic_id: str,
+        start_time: datetime,
+        end_time: datetime | None,
+    ) -> list[tuple[datetime, float | None, float | None]]:
+        """Načte řádky `(start_utc, state, sum)` z Recorderu pro dané období."""
+        rows_by_id = await recorder.async_add_executor_job(
+            statistics_during_period,
+            self.hass,
+            start_time,
+            end_time,
+            {statistic_id},
+            "hour",
+            None,
+            {"state", "sum"},
+        )
+        parsed: list[tuple[datetime, float | None, float | None]] = []
+        for row in (rows_by_id or {}).get(statistic_id) or []:
+            start = _stat_row_start(row)
+            if start is None:
+                continue
+            state = row.get("state")
+            total = row.get("sum")
+            parsed.append(
+                (
+                    start,
+                    float(state) if state is not None else None,
+                    float(total) if total is not None else None,
+                )
+            )
+        parsed.sort(key=lambda item: item[0])
+        return parsed
+
+    async def _async_write_external_statistic(
+        self,
+        recorder: Any,
+        statistic_id: str,
+        stat_name: str,
+        hourly_deltas: dict[datetime, float],
+        *,
+        unit_of_measurement: str | None,
+        unit_class: str | None,
+        precision: int = 4,
+    ) -> float | None:
+        """Zapíše hodinové přírůstky do externí statistiky se zachováním
+        monotonie, sloučením s existujícími body a posunem následných sum."""
+        if not hourly_deltas:
+            return None
+
+        min_hour = min(hourly_deltas)
+        max_hour = max(hourly_deltas)
+
+        baseline_sum = await self._async_get_baseline_sum(
+            recorder, statistic_id, min_hour
+        )
+        existing_in_window = await self._async_read_stat_rows(
+            recorder,
+            statistic_id,
+            min_hour,
+            max_hour + timedelta(seconds=1),
+        )
+        subsequent_rows = await self._async_read_stat_rows(
+            recorder,
+            statistic_id,
+            max_hour + timedelta(seconds=1),
+            None,
+        )
+
+        statistics, final_sum = build_statistic_rows(
+            hourly_deltas,
+            existing_in_window,
+            baseline_sum,
+            subsequent_rows,
+            precision=precision,
+        )
+        if not statistics:
+            return None
+
+        metadata = self._build_metadata(
+            statistic_id,
+            stat_name,
+            unit_of_measurement=unit_of_measurement,
+            unit_class=unit_class,
+        )
+        _LOGGER.debug(
+            "Importuji %d bodů statistiky %s pro %s (konečná suma=%.4f)",
+            len(statistics),
+            statistic_id,
+            self._ean,
+            final_sum,
+        )
+        async_add_external_statistics(self.hass, metadata, statistics)
+        return final_sum
+
+    async def _async_update_pnd_statistics(self, signals_data: Any = None) -> None:
         statistic_id = self._statistic_id()
         recorder = get_instance(self.hass)
         now = datetime.now(timezone.utc)
@@ -387,6 +622,40 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             get_last_statistics, self.hass, 1, statistic_id, True, {"start", "sum"}
         )
         has_existing_data = bool(last_stats and last_stats.get(statistic_id))
+
+        # Zjistíme, zda máme k dispozici plán HDO (nebo jde o jednotarifní OM
+        # bez HDO) a zda už v databázi existují tarifní a nákladové statistiky.
+        lookup = ScheduleLookup(self._hdo_history or {})
+        is_single_tariff = (
+            not self._is_production
+            and not self._hdo_signal
+            and isinstance(signals_data, dict)
+            and not (signals_data.get("signals") or [])
+        )
+        can_split_tariffs = (not self._is_production) and (bool(lookup) or is_single_tariff)
+        fallback_all_vt = (not lookup) and is_single_tariff
+
+        vt_stat_id = self.statistic_id_for(STATISTIC_CONSUMPTION_VT)
+        nt_stat_id = self.statistic_id_for(STATISTIC_CONSUMPTION_NT)
+        cost_vt_stat_id = self.statistic_id_for(STATISTIC_COST_VT)
+        cost_nt_stat_id = self.statistic_id_for(STATISTIC_COST_NT)
+        cost_total_stat_id = self.statistic_id_for(STATISTIC_COST_TOTAL)
+
+        has_vt_stats = False
+        has_nt_stats = False
+        has_all_cost_stats = False
+        if not self._is_production:
+            has_vt_stats = await self._async_has_statistic(recorder, vt_stat_id)
+            has_nt_stats = await self._async_has_statistic(recorder, nt_stat_id)
+            has_all_cost_stats = (
+                await self._async_has_statistic(recorder, cost_vt_stat_id)
+                and await self._async_has_statistic(recorder, cost_nt_stat_id)
+                and await self._async_has_statistic(recorder, cost_total_stat_id)
+            )
+
+        backfill_floor = (now - timedelta(days=365 * MAX_BACKFILL_YEARS)).replace(
+            minute=0, second=0, microsecond=0
+        )
 
         if has_existing_data:
             row = last_stats[statistic_id][0]
@@ -408,7 +677,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # rovnou jen nejnovější bod bez zpětného doplnění mezery), bez
             # tohohle by taková díra ve statistikách zůstala navždy.
             fetch_start = min(
-                last_known_start + timedelta(minutes=self._assembly_interval_minutes),
+                last_known_start + timedelta(hours=1),
                 now - timedelta(days=PND_TRAILING_SAFETY_DAYS),
             )
             # Díry STARŠÍ než přeimportovací okno (issue #40) - ČEZ data
@@ -423,8 +692,28 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.debug("Kontrola děr ve statistice selhala (%s).", err)
             if gap_start is not None and gap_start < fetch_start:
                 fetch_start = gap_start
+
+            # Upgrade stávající instalace: celková spotřeba už v DB je, ale
+            # rozdělené statistiky VT/NT ještě neexistují -> natáhneme jednou
+            # 15min historii zpětně od začátku dostupné historie, aby měly VT/NT
+            # i náklady stejnou historii a 15min přesnost.
+            if can_split_tariffs and (not has_vt_stats or not has_nt_stats):
+                tariff_backfill_start = (
+                    max(self.pnd_first_timestamp, backfill_floor)
+                    if self.pnd_first_timestamp is not None
+                    else backfill_floor
+                )
+                if tariff_backfill_start < fetch_start:
+                    fetch_start = tariff_backfill_start
+                    _LOGGER.info(
+                        "Statistiky VT/NT (%s, %s) zatím neexistují - spouštím "
+                        "jednorázové zpětné doplnění 15min dat od %s.",
+                        vt_stat_id,
+                        nt_stat_id,
+                        dt_util.as_local(fetch_start).isoformat(),
+                    )
         else:
-            fetch_start = now - timedelta(days=365 * MAX_BACKFILL_YEARS)
+            fetch_start = backfill_floor
             _LOGGER.info(
                 "Žádné dřívější statistiky pro %s - zkouším dohledat historii "
                 "až %d let zpátky (kolik reálně existuje, závisí na tom, "
@@ -433,38 +722,20 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 MAX_BACKFILL_YEARS,
             )
 
+        # Zarovnat na začátek celé hodiny, aby u 15min dat nebyly oříznuté
+        # první čtvrthodiny a celá hraniční hodina se zbytečně nezahodila.
+        fetch_start = fetch_start.replace(minute=0, second=0, microsecond=0)
         if fetch_start >= now:
             return
 
-        # Běžící součet (kumulativní kWh pro HA Energy dashboard) musíme
-        # navázat na hodnotu odpovídající bodu TĚSNĚ PŘED fetch_start - ne
-        # nutně poslednímu naimportovanému bodu, protože díky ohlédnutí
-        # zpátky (výše) může fetch_start ležet dřív, než kam jsme se
-        # dostali minule. Přeimportování už uložených hodin je v pořádku
-        # (async_add_external_statistics existující body podle "start"
-        # přepíše), jen musí navazovat na správný základ. Při úplně prvním
-        # běhu prostě žádná dřívější data nenajde a zůstane na 0.
-        prior_stats = await recorder.async_add_executor_job(
-            statistics_during_period,
-            self.hass,
-            fetch_start - timedelta(hours=1),
-            fetch_start,
-            {statistic_id},
-            "hour",
-            None,
-            {"sum"},
-        )
-        baseline_sum = 0.0
-        rows = prior_stats.get(statistic_id) if prior_stats else None
-        if rows:
-            baseline_sum = float(rows[-1].get("sum") or 0.0)
-
+        used_assembly_code = self._assembly_code
         chunk_errors: list[Exception] = []
 
         def _log_chunk_error(chunk_start: datetime, chunk_end: datetime, err: Exception) -> None:
             chunk_errors.append(err)
             _LOGGER.debug(
-                "pnd/data pro okno %s .. %s selhalo (%s), přeskakuji.",
+                "pnd/data (assemblyCode=%s) pro okno %s .. %s selhalo (%s), přeskakuji.",
+                used_assembly_code,
                 chunk_start,
                 chunk_end,
                 err,
@@ -476,10 +747,40 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._ean,
             fetch_start,
             now,
-            self._assembly_code,
-            MAX_PND_INTERVAL_DAYS,
+            used_assembly_code,
+            pnd_max_interval_days_for(used_assembly_code),
             on_chunk_error=_log_chunk_error,
         )
+
+        # Automatický fallback z 15min ("03") na hodinová data ("05"), pokud
+        # pro dané odběrné místo 15min profil selhal na všech oknech.
+        if (
+            not raw_points
+            and chunk_errors
+            and not self._is_production
+            and used_assembly_code == PND_ASSEMBLY_15MIN
+        ):
+            _LOGGER.warning(
+                "Stažení 15min dat (assemblyCode=%s) pro %s selhalo (%s) - "
+                "zkouším záložní hodinová data (assemblyCode=%s).",
+                used_assembly_code,
+                self._ean,
+                chunk_errors[-1],
+                PND_ASSEMBLY_HOURLY,
+            )
+            used_assembly_code = PND_ASSEMBLY_HOURLY
+            chunk_errors.clear()
+            raw_points, unit = await fetch_pnd_chunked(
+                self._client,
+                self._partner,
+                self._ean,
+                fetch_start,
+                now,
+                used_assembly_code,
+                pnd_max_interval_days_for(used_assembly_code),
+                on_chunk_error=_log_chunk_error,
+            )
+
         if not raw_points:
             if chunk_errors:
                 # Všechna okna selhala (typicky opakovaný 403 z MEPAS/AWS
@@ -495,7 +796,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "(viz i pnd/status výše v logu - issue #30).",
                     self._ean,
                     self._partner,
-                    self._assembly_code,
+                    used_assembly_code,
                     "výroba" if self._is_production else "spotřeba",
                     len(chunk_errors),
                     statistic_id,
@@ -504,31 +805,27 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
 
         # Bezpečnostní pojistka (issue #24): krok dat odvozujeme přímo
-        # z časových značek odpovědi, ne jen z assemblyCode - u kódu
-        # PND_ASSEMBLY_HOURLY_PRODUCTION ("06", dodávka) máme zatím jen
-        # jeden ověřený reálný účet, a stejná chyba (špatný předpoklad
-        # intervalu -> 4x špatný přepočet kW/kWh) se dřív skryla i v
-        # diagnostickém skriptu. Pro známý spotřební kód "05" se odvozená
-        # hodnota vždy shoduje, takže tady nic neměníme.
-        interval_minutes = infer_interval_minutes(
-            raw_points, fallback=self._assembly_interval_minutes
+        # z časových značek odpovědi, ne jen z assemblyCode.
+        expected_interval = PND_INTERVAL_MINUTES_BY_ASSEMBLY.get(
+            used_assembly_code, self._assembly_interval_minutes
         )
-        if interval_minutes != self._assembly_interval_minutes:
+        interval_minutes = infer_interval_minutes(raw_points, fallback=expected_interval)
+        if interval_minutes != expected_interval:
             _LOGGER.warning(
                 "pnd/data pro %s (assemblyCode=%s): krok dat podle časových "
                 "značek je %d min, ne předpokládaných %d min - používám "
                 "odvozenou hodnotu (issue #24).",
                 self._ean,
-                self._assembly_code,
+                used_assembly_code,
                 interval_minutes,
-                self._assembly_interval_minutes,
+                expected_interval,
             )
 
         try:
             _LOGGER.debug(
                 "pnd/data souhrn pro %s (assemblyCode=%s, okno %s .. %s): %s",
                 self._ean,
-                self._assembly_code,
+                used_assembly_code,
                 fetch_start.isoformat(),
                 now.isoformat(),
                 json.dumps(summarize_pnd_points(raw_points), ensure_ascii=False),
@@ -536,7 +833,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         except Exception as err:  # noqa: BLE001 - diagnostika nesmí shodit import
             _LOGGER.debug("Souhrn pnd/data se nepodařil (%s).", err)
 
-        hourly_buckets, trimmed = process_pnd_response(
+        complete_points, hourly_buckets, trimmed = process_pnd_points(
             raw_points, unit, interval_minutes, fetch_start, now
         )
         if trimmed:
@@ -550,60 +847,165 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
 
         newest_hour_start = max(hourly_buckets)
-
-        statistics = []
-        running_sum = baseline_sum
-        for hour_start in sorted(hourly_buckets):
-            hour_kwh = hourly_buckets[hour_start]
-            running_sum += hour_kwh
-            statistics.append(
-                {
-                    "start": hour_start,
-                    "sum": running_sum,
-                    "state": hour_kwh,
-                }
-            )
+        oldest_hour_start = min(hourly_buckets)
 
         stat_name = (
             f"ČEZ dodávka do sítě {self._ean}"
             if self._is_production
             else f"ČEZ spotřeba {self._ean}"
         )
-        metadata = {
-            "has_mean": False,
-            "has_sum": True,
-            "name": stat_name,
-            "source": DOMAIN,
-            "statistic_id": statistic_id,
-            "unit_of_measurement": UnitOfEnergy.KILO_WATT_HOUR,
-            # Vyžadováno novějšími verzemi HA (recorder od podzimu 2025 bez
-            # tohohle pole import statistik odmítá).
-            "unit_class": "energy",
-        }
-        if StatisticMeanType is not None:
-            # Nahrazuje deprecated has_mean bool - HA 2026.11+ ho bude
-            # vyžadovat povinně, se starším has_mean ale zatím funguje
-            # obojí zároveň.
-            metadata["mean_type"] = StatisticMeanType.NONE
-
-        _LOGGER.debug(
-            "Importuji %s nových bodů hodinové spotřeby pro %s (statistic_id=%s)",
-            len(statistics),
-            self._ean,
-            statistic_id,
-        )
         # 'last_pnd_timestamp' (diagnostická entita) se aktualizuje AŽ PO
         # úspěšném zápisu, ne dřív - kdyby async_add_external_statistics
         # selhalo (výjimka), diagnostická entita nemá lhát, že máme data,
         # která ve skutečnosti neproběhla. Skutečný zdroj pravdy pro
-        # fetch_start příštího běhu je vždy get_last_statistics() (reálný
-        # stav HA databáze), ne tahle proměnná - tahle je jen pro zobrazení.
-        async_add_external_statistics(self.hass, metadata, statistics)
+        # fetch_start příštího běhu je vždy get_last_statistics().
+        final_total = await self._async_write_external_statistic(
+            recorder,
+            statistic_id,
+            stat_name,
+            hourly_buckets,
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            unit_class="energy",
+        )
         self.last_pnd_timestamp = newest_hour_start + timedelta(hours=1)
-        self.pnd_total_kwh = running_sum
-        oldest_hour_start = min(hourly_buckets)
+        if final_total is not None:
+            self.pnd_total_kwh = final_total
         if self.pnd_first_timestamp is None or oldest_hour_start < self.pnd_first_timestamp:
             self.pnd_first_timestamp = oldest_hour_start
+
+        if self._is_production:
+            return
+
+        if not can_split_tariffs:
+            _LOGGER.debug(
+                "Přeskakuji zápis statistik VT/NT a nákladů pro %s - zatím "
+                "chybí plán HDO z portálu.",
+                self._ean,
+            )
+            return
+
+        split = split_interval_consumption(
+            complete_points,
+            interval_minutes,
+            lookup,
+            dt_util.as_local,
+            fallback_all_vt=fallback_all_vt,
+        )
+        if split is None:
+            return
+
+        hourly_vt = dict(split.hourly_vt)
+        hourly_nt = dict(split.hourly_nt)
+
+        # Pokud při prvním vytvoření VT/NT statistik existují v celkové
+        # spotřebě ještě starší hodiny než nejstarší stažený 15min bod,
+        # doplníme je hodinovým rozpadem podle HDO, aby se časová osa
+        # všech statistik přesně kryla.
+        if (
+            (not has_vt_stats or not has_nt_stats)
+            and self.pnd_first_timestamp is not None
+            and self.pnd_first_timestamp < oldest_hour_start
+        ):
+            older_total_rows = await self._async_read_stat_rows(
+                recorder,
+                statistic_id,
+                self.pnd_first_timestamp,
+                oldest_hour_start - timedelta(seconds=1),
+            )
+            older_points = [
+                (ts, max(state, 0.0))
+                for ts, state, _ in older_total_rows
+                if state is not None
+            ]
+            if older_points:
+                older_split = split_interval_consumption(
+                    older_points,
+                    60,
+                    lookup,
+                    dt_util.as_local,
+                    fallback_all_vt=fallback_all_vt,
+                )
+                if older_split is not None:
+                    for ts, val in older_split.hourly_vt.items():
+                        hourly_vt.setdefault(ts, val)
+                    for ts, val in older_split.hourly_nt.items():
+                        hourly_nt.setdefault(ts, val)
+
+        await self._async_write_external_statistic(
+            recorder,
+            vt_stat_id,
+            f"ČEZ spotřeba VT {self._ean}",
+            hourly_vt,
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            unit_class="energy",
+        )
+        await self._async_write_external_statistic(
+            recorder,
+            nt_stat_id,
+            f"ČEZ spotřeba NT {self._ean}",
+            hourly_nt,
+            unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+            unit_class="energy",
+        )
+
+        # Nákladové statistiky VT / NT / celkem podle cen z konfigurace.
+        cost_source_vt = dict(hourly_vt)
+        cost_source_nt = dict(hourly_nt)
+        min_tariff_hour = min(cost_source_vt) if cost_source_vt else oldest_hour_start
+        if (
+            not has_all_cost_stats
+            and has_vt_stats
+            and has_nt_stats
+            and self.pnd_first_timestamp is not None
+            and self.pnd_first_timestamp < min_tariff_hour
+        ):
+            prior_vt = await self._async_read_stat_rows(
+                recorder,
+                vt_stat_id,
+                self.pnd_first_timestamp,
+                min_tariff_hour - timedelta(seconds=1),
+            )
+            prior_nt = await self._async_read_stat_rows(
+                recorder,
+                nt_stat_id,
+                self.pnd_first_timestamp,
+                min_tariff_hour - timedelta(seconds=1),
+            )
+            for ts, state, _ in prior_vt:
+                if state is not None:
+                    cost_source_vt.setdefault(ts, max(state, 0.0))
+            for ts, state, _ in prior_nt:
+                if state is not None:
+                    cost_source_nt.setdefault(ts, max(state, 0.0))
+
+        costs_vt, costs_nt, costs_total = calculate_hourly_costs(
+            cost_source_vt, cost_source_nt, self._price_vt, self._price_nt
+        )
+        currency = self._currency()
+        await self._async_write_external_statistic(
+            recorder,
+            cost_vt_stat_id,
+            f"ČEZ náklady VT {self._ean}",
+            costs_vt,
+            unit_of_measurement=currency,
+            unit_class=None,
+        )
+        await self._async_write_external_statistic(
+            recorder,
+            cost_nt_stat_id,
+            f"ČEZ náklady NT {self._ean}",
+            costs_nt,
+            unit_of_measurement=currency,
+            unit_class=None,
+        )
+        await self._async_write_external_statistic(
+            recorder,
+            cost_total_stat_id,
+            f"ČEZ celkové náklady {self._ean}",
+            costs_total,
+            unit_of_measurement=currency,
+            unit_class=None,
+        )
 
     async def _async_find_old_statistic_gap(
         self,
@@ -682,10 +1084,11 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         Historie odečtů z portálu se aktualizuje jen při odečtu (u
         většiny odběrných míst jednou měsíčně), takže "Stav elektroměru
-        VT/NT" může být i několik týdnů starý. Statistika
-        cez:<ean>_consumption ale má hodinovou spotřebu až skoro do
+        VT/NT" může být i několik týdnů starý. Statistiky
+        cez:<ean>_consumption/_vt/_nt ale mají spotřebu až skoro do
         současnosti - součet hodinových hodnot od okamžiku odečtu do konce
-        importovaných dat je spotřeba od odečtu. Rozdělení na VT/NT viz
+        importovaných dat je spotřeba od odečtu. Rozdělení na VT/NT bere
+        přednostně 15min-přesné statistiky VT/NT, se zálohou na
         _split_meter_estimate (issue #49)."""
         if not isinstance(readings, list) or not readings:
             self.meter_estimate = None
@@ -707,6 +1110,8 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
 
         hours: list[tuple[datetime, float]] = []
+        vt_hours: list[tuple[datetime, float]] = []
+        nt_hours: list[tuple[datetime, float]] = []
         missing_hours = 0
         zero_hours = 0
         if base_time >= self.last_pnd_timestamp:
@@ -720,13 +1125,15 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # statistice se tak dá poznat a ukázat v atributech, místo aby
             # tiše snížila odhad.
             statistic_id = self._statistic_id()
+            vt_stat_id = self.statistic_id_for(STATISTIC_CONSUMPTION_VT)
+            nt_stat_id = self.statistic_id_for(STATISTIC_CONSUMPTION_NT)
             recorder = get_instance(self.hass)
             rows_by_id = await recorder.async_add_executor_job(
                 statistics_during_period,
                 self.hass,
                 base_time,
                 self.last_pnd_timestamp,
-                {statistic_id},
+                {statistic_id, vt_stat_id, nt_stat_id},
                 "hour",
                 None,
                 {"state"},
@@ -738,6 +1145,21 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     continue
                 hours.append((start, max(float(state), 0.0)))
             hours.sort(key=lambda item: item[0])
+
+            for row in (rows_by_id or {}).get(vt_stat_id) or []:
+                start = _stat_row_start(row)
+                state = row.get("state")
+                if start is not None and state is not None:
+                    vt_hours.append((start, max(float(state), 0.0)))
+            vt_hours.sort(key=lambda item: item[0])
+
+            for row in (rows_by_id or {}).get(nt_stat_id) or []:
+                start = _stat_row_start(row)
+                state = row.get("state")
+                if start is not None and state is not None:
+                    nt_hours.append((start, max(float(state), 0.0)))
+            nt_hours.sort(key=lambda item: item[0])
+
             if not hours or hours[0][0] > base_time:
                 # Statistika okamžik odečtu nepokrývá (začíná až po něm,
                 # např. elektroměr/backfill novější než odečet) - přírůstek
@@ -778,7 +1200,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         try:
             self.meter_estimate["tariffs"] = self._split_meter_estimate(
-                readings[0], hours, increment
+                readings[0], hours, increment, vt_hours=vt_hours, nt_hours=nt_hours
             )
         except Exception:  # noqa: BLE001
             _LOGGER.exception(
@@ -832,15 +1254,16 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         reading: dict[str, Any],
         hours: list[tuple[datetime, float]],
         increment: float,
+        *,
+        vt_hours: list[tuple[datetime, float]] | None = None,
+        nt_hours: list[tuple[datetime, float]] | None = None,
     ) -> dict[str, Any] | None:
         """Rozdělí odhad stavu elektroměru na VT a NT podle plánu HDO (issue #49).
 
-        Každá hodina spotřeby od odečtu (`hours`, viz
-        _async_update_meter_estimate) se rozpočítá podle toho, kolik minut
-        z ní podle plánu HDO připadá na NT (uvnitř hodiny předpokládá
-        rovnoměrnou spotřebu). Je to odhad - skutečné sepnutí relé se od
-        plánu může o pár minut lišit a pro dny, které portál už neukazuje,
-        se bere zapamatovaný plán nebo plán stejného dne v týdnu.
+        Pokud už v Recorderu existují 15min-přesné statistiky `consumption_vt`
+        a `consumption_nt` pokrývající stejné hodiny od odečtu, použijí se přímo
+        (aby odhad souhlasil s Energy panelem). Jinak se provede záložní
+        hodinový rozpad podle plánu HDO.
         """
         base_vt, base_nt = reading_registers(reading)
         if base_vt is None or base_nt is None:
@@ -863,6 +1286,39 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         if increment <= 0 or not hours:
             return result
+
+        # Přednostně použít již uložené statistiky VT/NT (počítané z 15min dat).
+        if vt_hours and nt_hours and len(vt_hours) == len(hours) and len(nt_hours) == len(hours):
+            vt_map = dict(vt_hours)
+            nt_map = dict(nt_hours)
+            if all(ts in vt_map and ts in nt_map for ts, _ in hours):
+                daily: dict[date, list[float]] = {}
+                inc_vt = 0.0
+                inc_nt = 0.0
+                for ts, _ in hours:
+                    vt = vt_map[ts]
+                    nt = nt_map[ts]
+                    inc_vt += vt
+                    inc_nt += nt
+                    day = daily.setdefault(dt_util.as_local(ts).date(), [0.0, 0.0])
+                    day[0] += vt
+                    day[1] += nt
+                days_known, days_weekday, days_nearest = count_schedule_sources(
+                    (ts for ts, _ in hours), lookup, dt_util.as_local
+                )
+                result["increment_vt"] = inc_vt
+                result["increment_nt"] = inc_nt
+                result["days_known"] = days_known
+                result["days_weekday"] = days_weekday
+                result["days_nearest"] = days_nearest
+                if daily:
+                    last_day = max(daily)
+                    result["last_day"] = {
+                        "date": last_day,
+                        "vt": daily[last_day][0],
+                        "nt": daily[last_day][1],
+                    }
+                return result
 
         split = split_hourly_consumption(hours, lookup, dt_util.as_local)
         if split is None or split.hours == 0:

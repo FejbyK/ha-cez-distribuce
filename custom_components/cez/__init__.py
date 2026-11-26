@@ -28,7 +28,11 @@ from .const import (
     CONF_PASSWORD,
     CONF_PORTAL_ENVIRONMENT,
     CONF_PORTAL_PARTNER,
+    CONF_PRICE_NT,
+    CONF_PRICE_VT,
     CONF_USERNAME,
+    DEFAULT_PRICE_NT,
+    DEFAULT_PRICE_VT,
     DOMAIN,
     OM_TYPE_CONSUMPTION,
 )
@@ -201,6 +205,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _LOGGER.debug("Přihlášení config entry dokončeno; pokračuji načtením dat.")
     partner = entry.data.get(CONF_PARTNER, "")
     anlage = entry.data.get(CONF_ANLAGE, "")
+    price_vt = float(
+        entry.options.get(CONF_PRICE_VT, entry.data.get(CONF_PRICE_VT, DEFAULT_PRICE_VT))
+    )
+    price_nt = float(
+        entry.options.get(CONF_PRICE_NT, entry.data.get(CONF_PRICE_NT, DEFAULT_PRICE_NT))
+    )
 
     def _store_new_uid(new_uid: str) -> None:
         # Portál pro stejný EAN vrátil jiné UID (issue #43) - coordinator
@@ -216,6 +226,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         anlage=anlage,
         om_type=om_type,
         hdo_signal=entry.data.get(CONF_HDO_SIGNAL, ""),
+        price_vt=price_vt,
+        price_nt=price_nt,
         on_uid_changed=_store_new_uid,
     )
     await coordinator.async_config_entry_first_refresh()

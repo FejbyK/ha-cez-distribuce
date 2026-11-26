@@ -60,7 +60,7 @@
     "step": {
       "init": {
         "title": "Ceny elektřiny",
-        "description": "Ceny pro senzor Aktuální cena. Po uložení se integrace znovu načte.",
+        "description": "Ceny pro senzor Aktuální cena a nákladové statistiky (cost_vt, cost_nt, cost_total). Po uložení se integrace znovu načte.",
         "data": {
           "price_vt": "Cena VT (Kč/kWh)",
           "price_nt": "Cena NT (Kč/kWh)"

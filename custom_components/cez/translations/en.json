@@ -60,7 +60,7 @@
     "step": {
       "init": {
         "title": "Electricity prices",
-        "description": "Prices used by the Current price sensor. The integration reloads after saving.",
+        "description": "Prices used by the Current price sensor and cost statistics (cost_vt, cost_nt, cost_total). The integration reloads after saving.",
         "data": {
           "price_vt": "High tariff price (CZK/kWh)",
           "price_nt": "Low tariff price (CZK/kWh)"

@@ -139,16 +139,16 @@ Podrobnosti o výpočtu dodávky do sítě najdete v části [Celková dodávka 
 
 Průběžnou spotřebu najdete:
 
-- ve statistice `cez:<ean>_consumption` (hodinová data, viz [Hodinová spotřeba](#hodinová-spotřeba)) – bez rozlišení VT/NT,
+- ve statistikách `cez:<ean>_consumption` (celková spotřeba), `cez:<ean>_consumption_vt` (VT) a `cez:<ean>_consumption_nt` (NT) – viz [Hodinová spotřeba a Energy dashboard](#hodinová-spotřeba),
 - v senzoru `sensor.odhadovany_stav_elektromeru`, který k poslednímu odečtu (VT+NT) přičítá hodinovou spotřebu od data odečtu. Mění se jednou denně, protože ČEZ hodinová data zveřejňuje zpětně, obvykle kolem 1:00 v noci za celý předchozí den. Atributy ukazují použitý odečet, přírůstek od odečtu a konec hodinových dat. Atributy `chybejici_hodiny` a `nulove_hodiny` ukazují, kolik hodin od odečtu ve statistice chybí nebo má podezřele nulovou spotřebu (3 a víc hodin po sobě) – v tom případě je odhad podhodnocený. Integrace jednou denně kontroluje statistiku za posledních 62 dní a když v ní najde díru, stáhne hodinová data od toho místa znovu (ČEZ je někdy doplní se zpožděním, typicky kolem změny sazby).
 
 ### Odhad VT/NT podle HDO
 
-Hodinová data tarif nerozlišují, ale plán spínání HDO známe. `sensor.odhadovany_stav_elektromeru_vt` a `sensor.odhadovany_stav_elektromeru_nt` proto každou hodinu spotřeby od posledního odečtu rozdělí podle toho, kolik minut z ní podle plánu HDO připadá na NT, a přičtou ji k odečtenému stavu VT, resp. NT. Součet obou senzorů vždy odpovídá `sensor.odhadovany_stav_elektromeru`. Při novém odečtu se oba srovnají na skutečný stav. Stejně jako součtový odhad se mění jednou denně – ČEZ hodinová data zveřejňuje zpětně, obvykle kolem 1:00 v noci za celý předchozí den.
+Data z `pnd/data` tarif nerozlišují, ale plán spínání HDO známe. Integrace pro spotřebu stahuje **15minutový profil** (`assemblyCode=03`, s automatickým fallbackem na hodinová data `05`), každý 15minutový interval rozdělí podle počtu minut NT z plánu HDO a výsledky agreguje do hodinových statistik VT/NT (`cez:<ean>_consumption_vt` a `cez:<ean>_consumption_nt`). Ze stejného rozdělení vycházejí i senzory `sensor.odhadovany_stav_elektromeru_vt` a `sensor.odhadovany_stav_elektromeru_nt`, jejichž součet vždy odpovídá `sensor.odhadovany_stav_elektromeru`. Při novém odečtu se oba srovnají na skutečný stav. Stejně jako součtový odhad se mění jednou denně – ČEZ data zveřejňuje zpětně, obvykle kolem 1:00 v noci za celý předchozí den.
 
 Jde o odhad:
 
-- uvnitř hodiny se počítá s rovnoměrnou spotřebou (např. hodina 22:00–23:00 s NT od 22:35 jde z 25/60 do NT),
+- uvnitř 15minutového intervalu se počítá s rovnoměrnou spotřebou (např. u NT od 22:35 jdou intervaly 22:00–22:30 celé do VT, interval 22:30–22:45 z 10/15 do NT a interval 22:45–23:00 celý do NT),
 - skutečné sepnutí relé se od plánu může o pár minut lišit,
 - portál ukazuje plán HDO jen pro dnešek a několik dní dopředu, ale hodinová data za daný den přijdou až druhý den kolem 1:00, kdy už ho portál neukazuje. Integrace si proto plán každého dne uloží, dokud je ještě aktuální (až rok zpět), a v ustáleném stavu tak počítá podle skutečného plánu. Plán stejného dne v týdnu použije jen pro dny, které nezná – typicky dny mezi posledním odečtem a prvním spuštěním této verze. Kolik dní bylo spočítáno podle skutečného plánu a kolik podle dne v týdnu, ukazují atributy `dny_s_planem_hdo_z_portalu` a `dny_s_planem_podle_dne_v_tydnu`.
 
@@ -163,11 +163,25 @@ Přesné denní stavy registrů VT/NT nabízí API aplikace Proud jen u části 
 > [!IMPORTANT]
 > Tato funkce vyžaduje chytrý elektroměr a používá neoficiální, reverzně analyzované API mobilní aplikace **Proud**, které je odlišné od API portálu `dip.cezdistribuce.cz`. ČEZ může toto API kdykoliv změnit bez předchozího upozornění. U odběrných míst bez chytrého elektroměru se import hodinových dat tiše přeskočí a ostatní části integrace fungují beze změny.
 
-Pokud máte chytrý elektroměr, integrace stahuje hodinovou spotřebu a ukládá ji jako dlouhodobou statistiku Home Assistantu:
+Pokud máte chytrý elektroměr, integrace stahuje 15minutový profil spotřeby (`assemblyCode=03`, s automatickým fallbackem na hodinový `05`), rozděluje jej podle plánu HDO na VT/NT a ukládá výsledky jako externí dlouhodobé statistiky Home Assistantu:
 
-```text
-cez:<ean>_consumption
-```
+| Statistika | Jednotka | Popis |
+| --- | --- | --- |
+| `cez:<ean>_consumption` | kWh | Celková hodinová spotřeba (VT + NT) |
+| `cez:<ean>_consumption_vt` | kWh | Hodinová spotřeba ve vysokém tarifu (VT) |
+| `cez:<ean>_consumption_nt` | kWh | Hodinová spotřeba v nízkém tarifu (NT) |
+| `cez:<ean>_cost_vt` | měna HA (CZK) | Náklady VT podle ceny VT v konfiguraci integrace |
+| `cez:<ean>_cost_nt` | měna HA (CZK) | Náklady NT podle ceny NT v konfiguraci integrace |
+| `cez:<ean>_cost_total` | měna HA (CZK) | Celkové náklady (součet VT + NT) |
+
+### Nastavení v Energy dashboardu
+
+- **Rozdělená spotřeba VT a NT**: do **Spotřeba ze sítě** přidejte dvě položky:
+  - `cez:<ean>_consumption_vt` (s přiřazenou statistikou nákladů `cez:<ean>_cost_vt`, případně statickou cenou),
+  - `cez:<ean>_consumption_nt` (s přiřazenou statistikou nákladů `cez:<ean>_cost_nt`, případně statickou cenou).
+- **Celková spotřeba**: pokud nechcete rozlišení tarifů, přidejte pouze `cez:<ean>_consumption` (s případnou statistikou nákladů `cez:<ean>_cost_total`). Nepřidávejte současně `consumption` i `consumption_vt` + `consumption_nt`, jinak se spotřeba započítá dvakrát.
+- Přesné názvy všech statistik pro vaše odběrné místo najdete také v atributu `statistiky` diagnostické entity `sensor.hodinova_data_spotreby_k`.
+- Při přechodu ze starší verze integrace (kde již existuje `cez:<ean>_consumption`) se chybějící statistiky VT/NT a nákladů při první aktualizaci automaticky zpětně doplní.
 
 ČEZ hodinová data zveřejňuje zpětně, obvykle kolem 1:00 v noci za celý předchozí den. Statistika i diagnostická entita `sensor.hodinova_data_spotreby_k` proto během dne končí na včerejší půlnoci – to je očekávané chování.
 

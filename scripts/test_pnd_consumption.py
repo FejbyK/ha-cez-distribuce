@@ -65,11 +65,13 @@ if str(_CEZ_DIR) not in sys.path:
 
 from api import CezApiError, CezAuthError, CezDistribuceApiClient  # noqa: E402
 from const import (  # noqa: E402
-    MAX_PND_INTERVAL_DAYS,
     PND_ASSEMBLY_15MIN,
+    PND_ASSEMBLY_CODE,
     PND_ASSEMBLY_HOURLY,
     PND_INTERVAL_MINUTES,
+    PND_INTERVAL_MINUTES_BY_ASSEMBLY,
     PND_TRAILING_SAFETY_DAYS,
+    pnd_max_interval_days_for,
 )
 from pnd_processing import (  # noqa: E402
     fetch_pnd_chunked,
@@ -145,9 +147,7 @@ def write_csv(path: Path, hourly_buckets: dict[datetime, float]) -> None:
 def _assumed_interval_minutes(assembly_code: str) -> int:
     """Předpokládaný krok dat pro daný assemblyCode - jen odhad, skutečný
     krok se vždy odvozuje z časových značek odpovědi (issue #24)."""
-    if assembly_code == PND_ASSEMBLY_15MIN:
-        return 15
-    return PND_INTERVAL_MINUTES
+    return PND_INTERVAL_MINUTES_BY_ASSEMBLY.get(assembly_code, PND_INTERVAL_MINUTES)
 
 
 async def run_assembly_code(
@@ -192,7 +192,7 @@ async def run_assembly_code(
 
     raw_points, unit = await fetch_pnd_chunked(
         client, partner, ean, fetch_start, fetch_end, assembly_code,
-        MAX_PND_INTERVAL_DAYS, on_chunk_error=_on_chunk_error,
+        pnd_max_interval_days_for(assembly_code), on_chunk_error=_on_chunk_error,
     )
     print(f"   Staženo syrových záznamů: {len(raw_points)}, jednotka: {unit}")
     summary["records"] = len(raw_points)
@@ -306,7 +306,7 @@ async def main() -> int:
     parser.add_argument(
         "--assembly",
         default=None,
-        help=f"assemblyCode pro pnd/data (výchozí z const.py: {PND_ASSEMBLY_HOURLY}=hodinová kWh, "
+        help=f"assemblyCode pro pnd/data (výchozí z const.py: {PND_ASSEMBLY_CODE}; {PND_ASSEMBLY_HOURLY}=hodinová kWh, "
         f"{PND_ASSEMBLY_15MIN}=15min kW). Lze zadat i jiný kód z výstupu --status, "
         "např. pro výrobní/mikrozdrojové EAN (issue #24), nebo víc kódů oddělených "
         "čárkou (např. 02,04,06,08,10,12) - každý se stáhne a vyhodnotí zvlášť (issue #30).",
@@ -359,7 +359,7 @@ async def main() -> int:
     password = args.password or os.getenv("CEZ_PASS") or getpass.getpass("Heslo ČEZ: ")
 
     assembly_codes = [
-        code.strip() for code in (args.assembly or PND_ASSEMBLY_HOURLY).split(",") if code.strip()
+        code.strip() for code in (args.assembly or PND_ASSEMBLY_CODE).split(",") if code.strip()
     ]
     if not assembly_codes:
         raise SystemExit("--assembly neobsahuje žádný kód.")

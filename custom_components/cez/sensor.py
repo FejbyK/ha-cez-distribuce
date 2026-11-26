@@ -36,6 +36,8 @@ from .const import (
     HDO_STATE_VT,
     OM_TYPE_CONSUMPTION,
     OM_TYPES_PRODUCTION,
+    STATISTIC_CONSUMPTION_NT,
+    STATISTIC_CONSUMPTION_VT,
 )
 from .coordinator import CezDistribuceCoordinator
 
@@ -609,11 +611,14 @@ class CezMeterEstimateTariffSensor(CoordinatorEntity[CezDistribuceCoordinator], 
             "posledni_odecet_k": dt_util.as_local(estimate["base_time"]).isoformat(),
             "spotreba_od_odectu_kwh": round(tariffs[f"increment_{self._key}"], 3),
             "hodinova_data_do": dt_util.as_local(estimate["data_until"]).isoformat(),
+            "statistic_id": self.coordinator.statistic_id_for(
+                STATISTIC_CONSUMPTION_VT if self._key == "vt" else STATISTIC_CONSUMPTION_NT
+            ),
             "dny_s_planem_hdo_z_portalu": tariffs["days_known"],
             "dny_s_planem_podle_dne_v_tydnu": tariffs["days_weekday"],
             "dny_s_nejblizsim_planem": tariffs["days_nearest"],
             "chybejici_hodiny": estimate.get("missing_hours", 0),
-            "poznamka": "Odhad podle plánu spínání HDO; hodinová data tarif nerozlišují.",
+            "poznamka": "Odhad podle plánu spínání HDO (15min profil rozdělený podle HDO).",
         }
         last_day = tariffs.get("last_day")
         if last_day:
@@ -756,19 +761,25 @@ class CezConsumptionFreshnessSensor(CoordinatorEntity[CezDistribuceCoordinator],
         pro tohoto partnera/EAN nabízí, ať je to vidět i bez čtení logu
         (Nastavení → Zařízení a služby → ČEZ → zařízení → tahle entita →
         Atributy)."""
+        attrs: dict[str, Any] = {
+            "statistiky": self.coordinator.statistic_ids,
+        }
         info = self.coordinator.pnd_status_info
         if not info:
-            return {}
-        return {
-            "pnd_status_partner": info.get("partner"),
-            "pnd_status_assembly_code_pouzity": info.get("assembly_code_used"),
-            "pnd_status_kody_nalezene": info.get("codes_found"),
-            "pnd_status_pouzity_kod_nabizen": info.get("assembly_code_offered"),
-            "pnd_status_chyba": info.get("error"),
-            "pnd_denni_registry_17_nabizeny": info.get("daily_registers_offered"),
-            "pnd_typ_mereni": info.get("measurement_types"),
-            "pnd_sondy_kodu": info.get("probes"),
-        }
+            return attrs
+        attrs.update(
+            {
+                "pnd_status_partner": info.get("partner"),
+                "pnd_status_assembly_code_pouzity": info.get("assembly_code_used"),
+                "pnd_status_kody_nalezene": info.get("codes_found"),
+                "pnd_status_pouzity_kod_nabizen": info.get("assembly_code_offered"),
+                "pnd_status_chyba": info.get("error"),
+                "pnd_denni_registry_17_nabizeny": info.get("daily_registers_offered"),
+                "pnd_typ_mereni": info.get("measurement_types"),
+                "pnd_sondy_kodu": info.get("probes"),
+            }
+        )
+        return attrs
 
 
 def _latest_reading(data: dict | None) -> dict | None:

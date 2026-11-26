@@ -75,6 +75,15 @@ HDO_STATE_VT = "VT"
 HDO_STATE_NT = "NT"
 HDO_STATE_UNKNOWN = "Neznámý"
 
+# Přípony externích dlouhodobých statistik (cez:<ean>_<suffix>)
+STATISTIC_CONSUMPTION = "consumption"
+STATISTIC_CONSUMPTION_VT = "consumption_vt"
+STATISTIC_CONSUMPTION_NT = "consumption_nt"
+STATISTIC_COST_VT = "cost_vt"
+STATISTIC_COST_NT = "cost_nt"
+STATISTIC_COST_TOTAL = "cost_total"
+STATISTIC_PRODUCTION = "production"
+
 # --- MEPAS / AWS Gateway (appka "Proud") - hodinová/15min spotřeba --------
 #
 # Appka Proud pro tohle NEPOUŽÍVÁ portálové /irj/portal API vůbec - má
@@ -96,18 +105,17 @@ AWS_API_GATEWAY_STATIC_URL = "https://prodng.cezdis-cloudapps.net"
 APP_VERSION = "2.4.7"
 APP_BUILD_NUMBER = "447"
 
-# assemblyCode "05" = hodinová data přímo v kWh (energie za hodinu, žádný
-# přepočet netřeba) - VÝCHOZÍ VOLBA. Méně dat na přenos i výpočet, a
-# stejně přesné - HA dlouhodobé statistiky (async_add_external_statistics)
-# umí ukládat jen po celých hodinách, takže jemnější rozlišení by se
-# beztak muselo zpětně agregovat na hodiny.
+# assemblyCode "03" = 15minutový PRŮMĚRNÝ VÝKON v kW (ne energie) - VÝCHOZÍ
+# VOLBA pro spotřebu. Přepočet na kWh za interval: hodnota_kW * (15/60) =
+# hodnota_kW / 4. Ověřeno křížovou kontrolou vůči "05" - součet čtyř 15min
+# hodnot děleno 4 dá přesně stejné číslo jako hodinový záznam z "05".
+# 15minutové rozlišení výrazně zpřesňuje rozpad spotřeby na VT/NT v hodinách,
+# kde se přepíná HDO (např. NT od 22:35 se zátěží spínanou až v NT), než se
+# výsledky agregují do hodinových dlouhodobých statistik HA.
 #
-# assemblyCode "03" = 15minutový PRŮMĚRNÝ VÝKON v kW (ne energie).
-# Přepočet na kWh za interval: hodnota_kW * (15/60) = hodnota_kW / 4.
-# Ověřeno křížovou kontrolou vůči "05" - součet čtyř 15min hodnot děleno 4
-# dá přesně stejné číslo jako hodinový záznam z "05". Zatím zbytečné (viz
-# výše), ale necháno připravené pro budoucnost, kdyby HA někdy umožnilo
-# ukládat externí statistiky i po kratších intervalech.
+# assemblyCode "05" = hodinová data přímo v kWh (energie za hodinu, žádný
+# přepočet netřeba) - používá se jako automatický fallback, pokud "03" pro
+# dané odběrné místo selže.
 #
 # Real-time dotahování po 15 minutách jsme záměrně NEIMPLEMENTOVALI -
 # elektroměr sám odesílá data na server ČEZ nárazově (v dávkách po
@@ -117,10 +125,9 @@ APP_BUILD_NUMBER = "447"
 PND_ASSEMBLY_HOURLY = "05"
 PND_ASSEMBLY_15MIN = "03"
 
-# Aktivní volba pro spotřebu - změň na PND_ASSEMBLY_15MIN, pokud by HA
-# v budoucnu umožnilo import externích statistik s kratším intervalem
-# než hodina.
-PND_ASSEMBLY_CODE = PND_ASSEMBLY_HOURLY
+# Aktivní volba pro spotřebu: 15min profil pro přesný rozpad VT/NT podle HDO
+# (s automatickým fallbackem na PND_ASSEMBLY_HOURLY v coordinator.py).
+PND_ASSEMBLY_CODE = PND_ASSEMBLY_15MIN
 
 # Dodávka do sítě (výroba/mikrozdroj, typ V/M/B) - MEPAS gateway pro ni
 # nabízí samostatnou, SUDOU sadu assemblyCode, zjevně jako protějšek
@@ -173,6 +180,7 @@ PND_INTERVAL_MINUTES_BY_ASSEMBLY = {
     PND_ASSEMBLY_HOURLY: 60,
     PND_ASSEMBLY_15MIN: 15,
     PND_ASSEMBLY_HOURLY_PRODUCTION: 60,
+    "02": 15,
 }
 PND_INTERVAL_MINUTES = PND_INTERVAL_MINUTES_BY_ASSEMBLY[PND_ASSEMBLY_CODE]
 
@@ -189,6 +197,18 @@ def pnd_assembly_code_for(om_type: str) -> str:
         else PND_ASSEMBLY_CODE
     )
 
+
+def pnd_max_interval_days_for(assembly_code: str) -> int:
+    """Maximální rozsah jednoho požadavku pnd/data podle granularity.
+
+    Pro hodinová data projde až 366 dní (tvrdý limit API); pro 15minutová
+    data používáme 90 dní (~8 640 záznamů), aby odpověď zůstala rychlá a
+    pod limity gateway/timeoutu."""
+    if PND_INTERVAL_MINUTES_BY_ASSEMBLY.get(assembly_code, 60) < 60:
+        return MAX_PND_15MIN_INTERVAL_DAYS
+    return MAX_PND_INTERVAL_DAYS
+
+
 # DŮLEŽITÉ: časové razítko "time" v odpovědi pnd/data označuje KONEC
 # intervalu, ne začátek (ověřeno křížovou kontrolou). Při importu do HA
 # statistik je nutné odečíst PND_INTERVAL_MINUTES, aby "start" pole
@@ -199,6 +219,7 @@ def pnd_assembly_code_for(om_type: str) -> str:
 # zaokrouhleno na rok i s přestupným). Delší backfill je nutné rozdělit
 # do více požadavků po sobě.
 MAX_PND_INTERVAL_DAYS = 366
+MAX_PND_15MIN_INTERVAL_DAYS = 90
 
 DATA_PND_LAST_IMPORTED = "pnd_last_imported"
 
