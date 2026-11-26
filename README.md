@@ -12,7 +12,6 @@
 [![Hassfest](https://img.shields.io/github/actions/workflow/status/FejbyK/ha-cez-distribuce/hassfest.yaml?branch=main&style=for-the-badge&label=Hassfest&labelColor=1F1F1F&color=F05A22)](https://github.com/FejbyK/ha-cez-distribuce/actions/workflows/hassfest.yaml)
 [![Licence GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-F05A22?style=for-the-badge&labelColor=1F1F1F)](LICENSE)
 
-[![Otevřít repozitář v Marketplace](https://my.home-assistant.io/badges/marketplace_repository.svg)](https://my.home-assistant.io/redirect/marketplace_repository/?owner=FejbyK&repository=ha-cez-distribuce&category=integration)
 
 </div>
 
@@ -64,6 +63,7 @@
 ---
 
 ## Rychlá instalace
+[![Otevřít repozitář v Marketplace](https://my.home-assistant.io/badges/marketplace_repository.svg)](https://my.home-assistant.io/redirect/marketplace_repository/?owner=FejbyK&repository=ha-cez-distribuce&category=integration)
 
 1. Klikněte na tlačítko **Otevřít repozitář v Marketplace** nahoře *(nebo v HA: **Nastavení → Marketplace → Přidat z odkazu** → `https://github.com/FejbyK/ha-cez-distribuce`; vlastní repozitář vyžaduje propojený GitHub účet)*.
 2. Nainstalujte **ČEZ Distribuce** *(u starších verzí HA restartujte Home Assistant)*.
