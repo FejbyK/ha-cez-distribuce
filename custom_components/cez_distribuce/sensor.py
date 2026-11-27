@@ -1088,9 +1088,10 @@ class CezConsumptionFreshnessSensor(CoordinatorEntity[CezDistribuceCoordinator],
                 "pnd_status_chyba": info.get("error"),
                 "pnd_denni_registry_17_nabizeny": info.get("daily_registers_offered"),
                 "pnd_typ_mereni": info.get("measurement_types"),
-                "pnd_sondy_kodu": info.get("probes"),
             }
         )
+        if info.get("probes") is not None:
+            attrs["pnd_sondy_kodu"] = info.get("probes")
         return attrs
 
 

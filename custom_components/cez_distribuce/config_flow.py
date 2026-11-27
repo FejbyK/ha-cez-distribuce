@@ -11,6 +11,11 @@ from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
 
+try:
+    from homeassistant.util.ssl import get_default_context
+except ImportError:
+    get_default_context = None  # type: ignore[assignment]
+
 from .api import (
     CezAuthError,
     CezDistribuceApiClient,
@@ -113,9 +118,11 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Přihlásí se nejvýše jednou a vrací klienta sdíleného pro celý flow."""
         if self._client is None:
             _LOGGER.debug("Config flow: vytvářím klienta a přihlašuji se k ČEZ.")
+            ssl_context = get_default_context() if get_default_context is not None else None
             client = CezDistribuceApiClient(
                 username=self._username,
                 password=self._password,
+                ssl_context=ssl_context,
             )
             try:
                 await client.login()
@@ -282,9 +289,11 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         entry = self._get_reauth_entry()
         errors: dict[str, str] = {}
         if user_input is not None:
+            ssl_context = get_default_context() if get_default_context is not None else None
             async with CezDistribuceApiClient(
                 username=entry.data[CONF_USERNAME],
                 password=user_input[CONF_PASSWORD],
+                ssl_context=ssl_context,
             ) as client:
                 try:
                     await client.login()
@@ -317,9 +326,11 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_PASSWORD: user_input[CONF_PASSWORD],
             }
             environment = None
+            ssl_context = get_default_context() if get_default_context is not None else None
             async with CezDistribuceApiClient(
                 username=user_input[CONF_USERNAME],
                 password=user_input[CONF_PASSWORD],
+                ssl_context=ssl_context,
             ) as client:
                 try:
                     await client.login()

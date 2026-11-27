@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any, Coroutine
 
 import aiohttp
 import voluptuous as vol
@@ -13,6 +14,11 @@ from homeassistant.exceptions import (
     ConfigEntryError,
     ConfigEntryNotReady,
 )
+
+try:
+    from homeassistant.util.ssl import get_default_context
+except ImportError:  # unit testy bez plného HA nebo starší prostředí
+    get_default_context = None  # type: ignore[assignment]
 
 from .api import (
     CezApiError,
@@ -54,6 +60,16 @@ SERVICE_RECALCULATE_SCHEMA = vol.Schema(
         vol.Optional("recalculate_costs_only", default=False): bool,
     }
 )
+
+
+def _async_create_background_task(
+    hass: HomeAssistant, coro: Coroutine[Any, Any, Any], name: str
+) -> Any:
+    """Spustí úlohu na pozadí tak, aby neblokovala start Home Assistantu."""
+    create_bg = getattr(hass, "async_create_background_task", None)
+    if callable(create_bg):
+        return create_bg(coro, name)
+    return hass.async_create_task(coro, name=name)
 
 
 def _async_register_services(hass: HomeAssistant) -> None:
@@ -234,10 +250,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if entry.data.get(CONF_PORTAL_ENVIRONMENT) and entry.data.get(CONF_PORTAL_PARTNER)
         else None
     )
+    ssl_context = get_default_context() if get_default_context is not None else None
     client = CezDistribuceApiClient(
         username=username,
         password=password,
         portal_environment=portal_environment,
+        ssl_context=ssl_context,
     )
 
     try:
@@ -287,6 +305,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         price_vt=price_vt,
         price_nt=price_nt,
         on_uid_changed=_store_new_uid,
+        defer_initial_pnd_sync=bool(partner and anlage),
     )
     await coordinator.async_config_entry_first_refresh()
     _LOGGER.debug("První načtení dat config entry dokončeno.")
@@ -296,8 +315,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _LOGGER.debug("Platformy ČEZ byly načteny.")
-    if not partner or not anlage:
-        task = hass.async_create_task(
+    if partner and anlage:
+        pnd_task = _async_create_background_task(
+            hass,
+            coordinator.async_sync_pnd_in_background(),
+            name=f"{DOMAIN} initial pnd sync {ean}",
+        )
+        entry.async_on_unload(pnd_task.cancel)
+        _LOGGER.debug("Synchronizace hodinových dat (MEPAS) běží na pozadí.")
+    else:
+        task = _async_create_background_task(
+            hass,
             _async_enrich_partner_and_anlage(hass, entry, client, coordinator, uid),
             name=f"{DOMAIN} enrich supply point metadata",
         )

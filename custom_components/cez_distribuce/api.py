@@ -1,6 +1,7 @@
 """Async REST klient pro ČEZ Distribuce."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -341,12 +342,14 @@ class CezDistribuceApiClient:
         base_url: str = CEZ_DISTRIBUCE_BASE_URL,
         client_id: str = CEZ_DISTRIBUCE_CLIENT_ID,
         portal_environment: tuple[str, str] | None = None,
+        ssl_context: Any = None,
     ) -> None:
         self._username = username
         self._password = password
         self._base_url = base_url
         self._client_id = client_id
         self._session = session
+        self._ssl_context = ssl_context
 
         # Výběr prostředí portálu (environmentId, partnerId), issue #37.
         # Předvolba z config entry; při každém (re)loginu se vybere znovu.
@@ -386,6 +389,15 @@ class CezDistribuceApiClient:
         self._api_token: str | None = None
         self._anon_api_token: str | None = None
 
+        # Zámky a generační čítače proti souběžnému re-loginu při paralelních
+        # požadavcích (např. get_readings + get_signals přes asyncio.gather).
+        self._login_lock = asyncio.Lock()
+        self._auth_generation = 0
+        self._anon_login_lock = asyncio.Lock()
+        self._anon_generation = 0
+        self._mepas_login_lock = asyncio.Lock()
+        self._mepas_generation = 0
+
         # MEPAS/AWS Gateway (appka Proud) - hodinová/15min spotřeba.
         # Token má krátkou platnost (JWT s 'exp'), obnovuje se přes
         # login_mepas() při každém volání get_pnd_* metod, které selžou
@@ -393,33 +405,49 @@ class CezDistribuceApiClient:
         self._mepas_access_token: str | None = None
         self._mepas_installation_id = uuid.uuid4().hex[:16]
 
+    def _make_connector(self) -> Any:
+        """Vytvoří TCPConnector se sdíleným SSL kontextem HA (bez blokujícího
+        načítání CA certifikátů v event loopu), pokud je k dispozici."""
+        if self._ssl_context is not None and hasattr(aiohttp, "TCPConnector"):
+            return aiohttp.TCPConnector(ssl=self._ssl_context)
+        return None
+
     def _get_auth_session(self) -> aiohttp.ClientSession:
         """Znovupoužitá session pro autentizovaný portál (velké hlavičky CAS/SAP)."""
         if self._auth_session is None or self._auth_session.closed:
-            self._auth_session = aiohttp.ClientSession(
-                cookie_jar=self._auth_cookie_jar,
-                max_line_size=8190 * 4,
-                max_field_size=8190 * 4,
-                timeout=REQUEST_TIMEOUT,
-            )
+            kwargs: dict[str, Any] = {
+                "cookie_jar": self._auth_cookie_jar,
+                "max_line_size": 8190 * 4,
+                "max_field_size": 8190 * 4,
+                "timeout": REQUEST_TIMEOUT,
+            }
+            if (connector := self._make_connector()) is not None:
+                kwargs["connector"] = connector
+            self._auth_session = aiohttp.ClientSession(**kwargs)
         return self._auth_session
 
     def _get_anon_session(self) -> aiohttp.ClientSession:
         """Znovupoužitá session pro anonymní portálové dotazy."""
         if self._anon_session is None or self._anon_session.closed:
-            self._anon_session = aiohttp.ClientSession(
-                cookie_jar=self._anon_cookie_jar,
-                timeout=REQUEST_TIMEOUT,
-            )
+            kwargs: dict[str, Any] = {
+                "cookie_jar": self._anon_cookie_jar,
+                "timeout": REQUEST_TIMEOUT,
+            }
+            if (connector := self._make_connector()) is not None:
+                kwargs["connector"] = connector
+            self._anon_session = aiohttp.ClientSession(**kwargs)
         return self._anon_session
 
     def _get_mepas_session(self) -> aiohttp.ClientSession:
         """Znovupoužitá session pro MEPAS / AWS Gateway (keep-alive přes více oken)."""
         if self._mepas_session is None or self._mepas_session.closed:
-            self._mepas_session = aiohttp.ClientSession(
-                cookie_jar=aiohttp.DummyCookieJar(),
-                timeout=REQUEST_TIMEOUT,
-            )
+            kwargs: dict[str, Any] = {
+                "cookie_jar": aiohttp.DummyCookieJar(),
+                "timeout": REQUEST_TIMEOUT,
+            }
+            if (connector := self._make_connector()) is not None:
+                kwargs["connector"] = connector
+            self._mepas_session = aiohttp.ClientSession(**kwargs)
         return self._mepas_session
 
     async def async_close(self) -> None:
@@ -448,7 +476,9 @@ class CezDistribuceApiClient:
           1) GET oidcAuthorize -> CAS přesměruje na login formulář
           2) POST přihlašovacích údajů -> callback -> portál dostane kód
           3) GET /token/get (autentizovaný API token)
-          4) anonymní token v čistém sessionu
+
+        Anonymní token (pro odstávky) se načítá až líně při prvním anonymním
+        dotazu, aby zbytečně neprodlužoval přihlášení ani config flow.
         """
         _LOGGER.debug("Přihlašuji se do ČEZ Distribuce...")
 
@@ -576,17 +606,35 @@ class CezDistribuceApiClient:
         # Krok 3b – mezikroky landing stránky (výběr prostředí, issue #37)
         await self._complete_landing_checks(auth_session)
         self._auth_cookies = self._auth_cookie_jar
+        self._auth_generation += 1
 
-        # Krok 4 – anonymní token (nový session bez přihlášení)
-        self._anon_cookie_jar.clear()
-        anon_session = self._get_anon_session()
-        token_url = f"{self._base_url}/anonymous/rest-auth-api?path=/token/get"
-        async with anon_session.get(token_url) as resp:
-            data = await self._read_json_response(resp, token_url)
-            self._anon_api_token = data if isinstance(data, str) else data.get("data") or data.get("token")
-        self._anon_cookies = self._anon_cookie_jar
+        _LOGGER.debug("Přihlášení OK, token načten.")
 
-        _LOGGER.debug("Přihlášení OK, tokeny načteny.")
+    async def _ensure_auth_relogin(self, failed_generation: int) -> None:
+        """Provede re-login nejvýše jednou pro danou generaci tokenu."""
+        async with self._login_lock:
+            if self._auth_generation == failed_generation:
+                await self.login()
+
+    async def _ensure_anon_token(self, *, failed_generation: int | None = None) -> None:
+        """Líně načte (nebo obnoví) anonymní token pro veřejné portálové dotazy."""
+        async with self._anon_login_lock:
+            if failed_generation is None and self._anon_api_token:
+                return
+            if failed_generation is not None and self._anon_generation != failed_generation:
+                return
+            self._anon_cookie_jar.clear()
+            anon_session = self._get_anon_session()
+            token_url = f"{self._base_url}/anonymous/rest-auth-api?path=/token/get"
+            async with anon_session.get(token_url) as resp:
+                data = await self._read_json_response(resp, token_url)
+                self._anon_api_token = (
+                    data
+                    if isinstance(data, str)
+                    else data.get("data") or data.get("token")
+                )
+            self._anon_cookies = self._anon_cookie_jar
+            self._anon_generation += 1
 
     # ------------------------------------------------------------------
     # Landing mezikroky (výběr prostředí, issue #37)
@@ -840,9 +888,13 @@ class CezDistribuceApiClient:
             f"&scope={MEPAS_SCOPE}"
         )
 
-        async with aiohttp.ClientSession(
-            cookie_jar=aiohttp.CookieJar(), timeout=REQUEST_TIMEOUT
-        ) as s:
+        mepas_login_kwargs: dict[str, Any] = {
+            "cookie_jar": aiohttp.CookieJar(),
+            "timeout": REQUEST_TIMEOUT,
+        }
+        if (connector := self._make_connector()) is not None:
+            mepas_login_kwargs["connector"] = connector
+        async with aiohttp.ClientSession(**mepas_login_kwargs) as s:
             async with s.get(authorize_url, allow_redirects=False) as resp:
                 if resp.status not in (301, 302, 303, 307, 308):
                     raise CezAuthError(
@@ -935,7 +987,18 @@ class CezDistribuceApiClient:
         if not self._mepas_access_token:
             raise CezAuthError(f"MEPAS token exchange nevrátil accessToken: {data}")
 
+        self._mepas_generation += 1
         _LOGGER.debug("MEPAS přihlášení OK.")
+
+    async def _ensure_mepas_token(self, *, failed_generation: int | None = None) -> None:
+        """Získá nebo obnoví MEPAS token bezpečně vůči souběžným požadavkům."""
+        async with self._mepas_login_lock:
+            if failed_generation is None and self._mepas_access_token:
+                return
+            if failed_generation is not None and self._mepas_generation != failed_generation:
+                return
+            self._mepas_access_token = None
+            await self.login_mepas()
 
     def _mepas_headers(self, *, is_post: bool = False) -> dict[str, str]:
         headers = {
@@ -968,8 +1031,9 @@ class CezDistribuceApiClient:
 
         for attempt in range(LOGIN_RETRIES):
             if not self._mepas_access_token:
-                await self.login_mepas()
+                await self._ensure_mepas_token()
 
+            token_gen = self._mepas_generation
             headers = self._mepas_headers(is_post=(method == "POST"))
             s = self._get_mepas_session()
             if method == "GET":
@@ -996,7 +1060,10 @@ class CezDistribuceApiClient:
                     attempt + 1,
                     text[:300],
                 )
-                self._mepas_access_token = None
+                if attempt < LOGIN_RETRIES - 1:
+                    await self._ensure_mepas_token(failed_generation=token_gen)
+                else:
+                    self._mepas_access_token = None
                 continue
 
             if status >= 400:
@@ -1091,11 +1158,15 @@ class CezDistribuceApiClient:
                 attempt + 1,
                 LOGIN_RETRIES,
             )
+            if not authenticated and not self._anon_api_token:
+                await self._ensure_anon_token()
+
             headers = {}
             if authenticated and self._api_token:
                 headers["X-Request-Token"] = self._api_token
             elif not authenticated and self._anon_api_token:
                 headers["X-Request-Token"] = self._anon_api_token
+            req_gen = self._auth_generation if authenticated else self._anon_generation
 
             s = self._get_auth_session() if authenticated else self._get_anon_session()
 
@@ -1107,12 +1178,15 @@ class CezDistribuceApiClient:
                     async with s.post(url, headers=headers, json=json or {}) as resp:
                         raw = await self._read_json_response(resp, url)
             except _InvalidJsonResponse as err:
-                if authenticated and err.looks_like_portal_html and attempt < LOGIN_RETRIES - 1:
+                if err.looks_like_portal_html and attempt < LOGIN_RETRIES - 1:
                     _LOGGER.debug(
                         "ČEZ vrátil HTML portál místo JSONu, obnovuji přihlášení... (pokus %d)",
                         attempt + 1,
                     )
-                    await self.login()
+                    if authenticated:
+                        await self._ensure_auth_relogin(req_gen)
+                    else:
+                        await self._ensure_anon_token(failed_generation=req_gen)
                     continue
                 raise
 
@@ -1120,9 +1194,13 @@ class CezDistribuceApiClient:
             if isinstance(raw, dict) and "statusCode" in raw:
                 status_code = raw["statusCode"]
                 if status_code == 401:
-                    _LOGGER.debug("Token expiroval, obnova... (pokus %d)", attempt + 1)
-                    await self.login()
-                    continue
+                    if attempt < LOGIN_RETRIES - 1:
+                        _LOGGER.debug("Token expiroval, obnova... (pokus %d)", attempt + 1)
+                        if authenticated:
+                            await self._ensure_auth_relogin(req_gen)
+                        else:
+                            await self._ensure_anon_token(failed_generation=req_gen)
+                        continue
                 elif status_code == 200:
                     return raw.get("data", raw)
             else:

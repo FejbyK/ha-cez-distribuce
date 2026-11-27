@@ -6,6 +6,7 @@ as well as `pytest` without requiring a full Home Assistant installation.
 """
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 import types
@@ -29,8 +30,11 @@ class _FakeRecorder:
     def __init__(self) -> None:
         self.stats: dict[str, dict[datetime, dict[str, Any]]] = {}
         self.write_calls: list[tuple[str, int]] = []
+        self.executor_jobs = 0
+        self.period_queries = 0
 
     async def async_add_executor_job(self, func, *args):
+        self.executor_jobs += 1
         return func(*args)
 
     def add_external_statistics(self, metadata: dict[str, Any], statistics: list[dict[str, Any]]) -> None:
@@ -59,6 +63,7 @@ class _FakeRecorder:
         period: str,
         *_args,
     ):
+        self.period_queries += 1
         result: dict[str, list[dict[str, Any]]] = {}
         for stat_id in statistic_ids:
             bucket = self.stats.get(stat_id, {})
@@ -407,16 +412,42 @@ def _restore_stubs(saved: dict[str, Any]) -> None:
 class _FakeApiClient:
     """Fake API client returning deterministic 15-min PND data."""
 
-    def __init__(self, pnd_values: list[dict[str, Any]]) -> None:
+    def __init__(
+        self,
+        pnd_values: list[dict[str, Any]],
+        *,
+        status_codes: list[str] | None = None,
+        readings: list[dict[str, Any]] | None = None,
+        signals: dict[str, Any] | None = None,
+        outages: list[dict[str, Any]] | None = None,
+    ) -> None:
         self._pnd_values = pnd_values
+        self._status_codes = status_codes if status_codes is not None else ["03", "05"]
+        self._readings = readings if readings is not None else []
+        self._signals = signals if signals is not None else {"signals": []}
+        self._outages = outages if outages is not None else []
         self.pnd_calls = 0
+        self.pnd_status_calls = 0
+        self.requested_assembly_codes: list[str] = []
 
-    async def get_pnd_data(self, **_kwargs):
+    async def get_readings(self, _uid: str):
+        return list(self._readings)
+
+    async def get_signals(self, _ean: str):
+        return dict(self._signals)
+
+    async def get_outages(self, _ean: str):
+        return list(self._outages)
+
+    async def get_pnd_data(self, **kwargs):
         self.pnd_calls += 1
+        if "assembly_code" in kwargs:
+            self.requested_assembly_codes.append(kwargs["assembly_code"])
         return [{"unit": "kW", "values": list(self._pnd_values)}]
 
     async def get_pnd_status(self, _partner: str):
-        return {"assemblyCodes": ["03", "05"]}
+        self.pnd_status_calls += 1
+        return {"assemblyCodes": list(self._status_codes)}
 
 
 def _make_day_15min_values(local_date_str: str, kw_value: float = 2.0) -> list[dict[str, Any]]:
@@ -811,6 +842,337 @@ class TestCoordinatorAndSensors(unittest.IsolatedAsyncioTestCase):
         added_prod: list[Any] = []
         await self.cez_bsensor.async_setup_entry(hass, entry_prod, added_prod.extend)
         self.assertEqual([type(e) for e in added_prod], [self.cez_bsensor.CezOutageSensor])
+
+    async def test_deferred_initial_pnd_sync_hydrates_locally_and_skips_unknown_probes(self) -> None:
+        fixed_now = datetime(2026, 4, 15, 10, 0, tzinfo=PRAGUE)
+        self.dt_util._now_override = fixed_now
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+        orig_dt = self.cez_coord.datetime
+        self.cez_coord.datetime = _FixedDatetime
+        self.addCleanup(setattr, self.cez_coord, "datetime", orig_dt)
+
+        recorder = _FakeRecorder()
+        hass = _FakeHass(recorder, currency="CZK")
+        pnd_values = (
+            _make_day_15min_values("2026-04-13", kw_value=2.0)
+            + _make_day_15min_values("2026-04-14", kw_value=2.0)
+        )
+        signals_data = {
+            "signals": [
+                {"signal": "a3b7dp01", "datum": "13.04.2026", "casy": "00:00-06:00"},
+                {"signal": "a3b7dp01", "datum": "14.04.2026", "casy": "00:00-06:00"},
+            ]
+        }
+        # Seed Recorder with existing data from a previous HA run
+        seed_client = _FakeApiClient(pnd_values, signals=signals_data)
+        seed_coord = self.cez_coord.CezDistribuceCoordinator(
+            hass,
+            seed_client,
+            ean="859182400100000077",
+            uid="uid-77",
+            partner="p-77",
+            anlage="a-77",
+            hdo_signal="a3b7dp01",
+            price_vt=5.0,
+            price_nt=2.0,
+        )
+        await seed_coord._async_update_hdo_history(signals_data)
+        await seed_coord._async_update_pnd_statistics(signals_data)
+
+        # Now simulate HA startup with defer_initial_pnd_sync=True and many unknown codes in pnd/status
+        client = _FakeApiClient(
+            pnd_values,
+            status_codes=["01", "03", "05", "07", "09", "11", "17"],
+            signals=signals_data,
+        )
+        coordinator = self.cez_coord.CezDistribuceCoordinator(
+            hass,
+            client,
+            ean="859182400100000077",
+            uid="uid-77",
+            partner="p-77",
+            anlage="a-77",
+            hdo_signal="a3b7dp01",
+            price_vt=5.0,
+            price_nt=2.0,
+            defer_initial_pnd_sync=True,
+        )
+        data = await coordinator._async_update_data()
+        coordinator.data = data
+
+        # Startup refresh must NOT touch MEPAS at all, yet local Recorder sensors are ready immediately
+        self.assertEqual(client.pnd_calls, 0)
+        self.assertEqual(client.pnd_status_calls, 0)
+        self.assertIsNotNone(coordinator.last_pnd_timestamp)
+        self.assertIsNotNone(coordinator.monthly_consumption)
+        self.assertAlmostEqual(coordinator.monthly_consumption["total_kwh"], 96.0, places=3)
+        self.assertIsNotNone(coordinator.last_day_consumption)
+        self.assertAlmostEqual(coordinator.last_day_consumption["total_kwh"], 48.0, places=3)
+
+        # Background sync runs MEPAS once and NEVER probes unknown assembly codes (01/07/09/11/17)
+        await coordinator.async_sync_pnd_in_background()
+        self.assertEqual(client.pnd_status_calls, 1)
+        self.assertGreater(client.pnd_calls, 0)
+        self.assertEqual(set(client.requested_assembly_codes), {"03"})
+        self.assertIsNotNone(coordinator._pnd_store._data)
+        self.assertIsNotNone(coordinator._pnd_store._data["last_pnd_fetch"])
+
+    async def test_persisted_pnd_state_skips_mepas_after_restart(self) -> None:
+        fixed_now = datetime(2026, 4, 15, 10, 0, tzinfo=PRAGUE)
+        self.dt_util._now_override = fixed_now
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+        orig_dt = self.cez_coord.datetime
+        self.cez_coord.datetime = _FixedDatetime
+        self.addCleanup(setattr, self.cez_coord, "datetime", orig_dt)
+
+        recorder = _FakeRecorder()
+        hass = _FakeHass(recorder, currency="CZK")
+        pnd_values = (
+            _make_day_15min_values("2026-04-13", kw_value=2.0)
+            + _make_day_15min_values("2026-04-14", kw_value=2.0)
+        )
+        signals_data = {
+            "signals": [
+                {"signal": "a3b7dp01", "datum": "13.04.2026", "casy": "00:00-06:00"},
+                {"signal": "a3b7dp01", "datum": "14.04.2026", "casy": "00:00-06:00"},
+            ]
+        }
+        first_client = _FakeApiClient(pnd_values, signals=signals_data)
+        first_coord = self.cez_coord.CezDistribuceCoordinator(
+            hass,
+            first_client,
+            ean="859182400100000088",
+            uid="uid-88",
+            partner="p-88",
+            anlage="a-88",
+            hdo_signal="a3b7dp01",
+        )
+        await first_coord._async_update_hdo_history(signals_data)
+        await first_coord._async_update_pnd_statistics(signals_data)
+        saved_pnd_state = dict(first_coord._pnd_store._data)
+
+        # New coordinator instance (simulating HA restart 30 minutes later) with persisted store
+        restarted_client = _FakeApiClient(pnd_values, signals=signals_data)
+        restarted_coord = self.cez_coord.CezDistribuceCoordinator(
+            hass,
+            restarted_client,
+            ean="859182400100000088",
+            uid="uid-88",
+            partner="p-88",
+            anlage="a-88",
+            hdo_signal="a3b7dp01",
+        )
+        restarted_coord._pnd_store._data = saved_pnd_state
+        await restarted_coord._async_update_hdo_history(signals_data)
+        recorder.period_queries = 0
+        await restarted_coord._async_update_pnd_statistics(signals_data)
+
+        # Fresh data + recent persisted fetch -> 0 MEPAS calls and 0 period DB scans!
+        self.assertEqual(restarted_client.pnd_calls, 0)
+        self.assertEqual(restarted_client.pnd_status_calls, 0)
+        self.assertEqual(recorder.period_queries, 0)
+        self.assertIsNotNone(restarted_coord.pnd_first_timestamp)
+
+    async def test_parallel_portal_fetches_and_batched_recorder_prefetch(self) -> None:
+        fixed_now = datetime(2026, 4, 15, 10, 0, tzinfo=PRAGUE)
+        self.dt_util._now_override = fixed_now
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+        orig_dt = self.cez_coord.datetime
+        self.cez_coord.datetime = _FixedDatetime
+        self.addCleanup(setattr, self.cez_coord, "datetime", orig_dt)
+
+        in_flight = 0
+        max_in_flight = 0
+
+        class _SlowParallelClient(_FakeApiClient):
+            async def _track(self, result):
+                nonlocal in_flight, max_in_flight
+                in_flight += 1
+                max_in_flight = max(max_in_flight, in_flight)
+                await asyncio.sleep(0.02)
+                in_flight -= 1
+                return result
+
+            async def get_readings(self, _uid: str):
+                return await self._track(list(self._readings))
+
+            async def get_signals(self, _ean: str):
+                return await self._track(dict(self._signals))
+
+            async def get_outages(self, _ean: str):
+                return await self._track(list(self._outages))
+
+        recorder = _FakeRecorder()
+        hass = _FakeHass(recorder, currency="CZK")
+        day1 = _make_day_15min_values("2026-04-13", kw_value=2.0)
+        day2 = _make_day_15min_values("2026-04-14", kw_value=2.0)
+        signals_data = {
+            "signals": [
+                {"signal": "a3b7dp01", "datum": "13.04.2026", "casy": "00:00-06:00"},
+                {"signal": "a3b7dp01", "datum": "14.04.2026", "casy": "00:00-06:00"},
+            ]
+        }
+        client = _SlowParallelClient(day1 + day2, signals=signals_data)
+        coordinator = self.cez_coord.CezDistribuceCoordinator(
+            hass,
+            client,
+            ean="859182400100000066",
+            uid="uid-66",
+            partner="p-66",
+            anlage="a-66",
+            hdo_signal="a3b7dp01",
+        )
+        await coordinator._async_update_data()
+        # All 3 independent portal requests must run concurrently
+        self.assertEqual(max_in_flight, 3)
+
+        # Now re-import only day 2 (where min_hour - 1h exists from day 1):
+        # all 6 statistics must be prefetched in ONE single statistics_during_period query!
+        client._pnd_values = day2
+        recorder.period_queries = 0
+        await coordinator._async_update_pnd_statistics(
+            signals_data,
+            force_fetch_start=datetime(2026, 4, 14, 0, 0, tzinfo=PRAGUE).astimezone(timezone.utc),
+        )
+        self.assertEqual(recorder.period_queries, 1)
+
+    async def test_concurrent_relogin_and_mepas_login_deduplication(self) -> None:
+        client = self.cez_api.CezDistribuceApiClient(username="u", password="p")
+        login_calls = 0
+        mepas_calls = 0
+
+        async def _fake_login() -> None:
+            nonlocal login_calls
+            login_calls += 1
+            await asyncio.sleep(0.02)
+            client._api_token = f"tok-{login_calls}"
+            client._auth_generation += 1
+
+        async def _fake_mepas_login() -> None:
+            nonlocal mepas_calls
+            mepas_calls += 1
+            await asyncio.sleep(0.02)
+            client._mepas_access_token = f"mepas-{mepas_calls}"
+            client._mepas_generation += 1
+
+        client.login = _fake_login  # type: ignore[method-assign]
+        client.login_mepas = _fake_mepas_login  # type: ignore[method-assign]
+
+        # Two concurrent 401 failures on generation 0 trigger only ONE login()
+        await asyncio.gather(
+            client._ensure_auth_relogin(0),
+            client._ensure_auth_relogin(0),
+        )
+        self.assertEqual(login_calls, 1)
+        self.assertEqual(client._auth_generation, 1)
+
+        # Two concurrent initial MEPAS requests trigger only ONE login_mepas()
+        await asyncio.gather(
+            client._ensure_mepas_token(),
+            client._ensure_mepas_token(),
+        )
+        self.assertEqual(mepas_calls, 1)
+
+    async def test_async_setup_entry_defers_pnd_to_background_task(self) -> None:
+        recorder = _FakeRecorder()
+        hass = _FakeHass(recorder, currency="CZK")
+        bg_tasks: list[asyncio.Task[Any]] = []
+        unload_callbacks: list[Any] = []
+
+        def _create_bg_task(coro, name):
+            task = asyncio.create_task(coro, name=name)
+            bg_tasks.append(task)
+            return task
+
+        hass.async_create_background_task = _create_bg_task
+
+        async def _forward(_entry, _platforms):
+            return True
+
+        hass.config_entries = types.SimpleNamespace(
+            async_forward_entry_setups=_forward,
+            async_update_entry=lambda *a, **kw: None,
+        )
+
+        entry = _FakeEntry(
+            entry_id="entry-bg",
+            title="Doma",
+            data={
+                self.cez_const.CONF_USERNAME: "u",
+                self.cez_const.CONF_PASSWORD: "p",
+                self.cez_const.CONF_EAN: "859182400100000044",
+                "uid": "uid-44",
+                self.cez_const.CONF_PARTNER: "p-44",
+                self.cez_const.CONF_ANLAGE: "a-44",
+                self.cez_const.CONF_HDO_SIGNAL: "a3b7dp01",
+            },
+        )
+        entry.async_on_unload = unload_callbacks.append
+
+        fake_client = _FakeApiClient(
+            _make_day_15min_values("2026-04-14", kw_value=2.0),
+            signals={
+                "signals": [
+                    {"signal": "a3b7dp01", "datum": "14.04.2026", "casy": "00:00-06:00"},
+                ]
+            },
+        )
+        fake_client.environment_options = []
+        fake_client.preferred_environment_missing = False
+        fake_client.login = lambda: asyncio.sleep(0)
+        fake_client.async_close = lambda: asyncio.sleep(0)
+
+        orig_client_cls = self.cez_init.CezDistribuceApiClient
+        orig_first_refresh = getattr(
+            self.cez_coord.CezDistribuceCoordinator, "async_config_entry_first_refresh", None
+        )
+
+        async def _first_refresh(coord_self):
+            coord_self.data = await coord_self._async_update_data()
+
+        self.cez_init.CezDistribuceApiClient = lambda **_kw: fake_client
+        self.cez_coord.CezDistribuceCoordinator.async_config_entry_first_refresh = _first_refresh
+        self.addCleanup(setattr, self.cez_init, "CezDistribuceApiClient", orig_client_cls)
+        if orig_first_refresh is None:
+            self.addCleanup(
+                delattr,
+                self.cez_coord.CezDistribuceCoordinator,
+                "async_config_entry_first_refresh",
+            )
+        else:
+            self.addCleanup(
+                setattr,
+                self.cez_coord.CezDistribuceCoordinator,
+                "async_config_entry_first_refresh",
+                orig_first_refresh,
+            )
+
+        ok = await self.cez_init.async_setup_entry(hass, entry)
+        self.assertTrue(ok)
+        # Setup finished without blocking on MEPAS!
+        self.assertEqual(fake_client.pnd_calls, 0)
+        self.assertEqual(fake_client.pnd_status_calls, 0)
+        self.assertEqual(len(bg_tasks), 1)
+
+        # Let the background task finish -> MEPAS sync completes and writes statistics
+        await asyncio.gather(*bg_tasks)
+        self.assertEqual(fake_client.pnd_status_calls, 1)
+        self.assertGreater(fake_client.pnd_calls, 0)
 
 
 if __name__ == "__main__":
