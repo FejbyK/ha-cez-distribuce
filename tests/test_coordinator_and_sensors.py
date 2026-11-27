@@ -348,17 +348,29 @@ def _install_stubs() -> dict[str, Any]:
     ha_storage = types.ModuleType("homeassistant.helpers.storage")
 
     class _FakeStore:
-        def __init__(self, _hass, _version, _key) -> None:
+        def __init__(self, hass, _version, key) -> None:
+            self._hass = hass
+            self._key = key
             self._data = None
 
         async def async_load(self):
+            backing = getattr(self._hass, "store_backing", None)
+            if backing is not None and self._key in backing:
+                return backing[self._key]
             return self._data
 
         async def async_save(self, data) -> None:
             self._data = data
+            backing = getattr(self._hass, "store_backing", None)
+            if backing is not None:
+                backing[self._key] = data
 
         def async_delay_save(self, data_func, _delay: float = 0) -> None:
-            self._data = data_func()
+            data = data_func()
+            self._data = data
+            backing = getattr(self._hass, "store_backing", None)
+            if backing is not None:
+                backing[self._key] = data
 
     ha_storage.Store = _FakeStore
     _put("homeassistant.helpers.storage", ha_storage)
@@ -378,6 +390,9 @@ def _install_stubs() -> dict[str, Any]:
 
         def async_set_updated_data(self, data) -> None:
             self.data = data
+
+        async def async_refresh(self) -> None:
+            self.data = await self._async_update_data()
 
     class _FakeCoordinatorEntity:
         def __class_getitem__(cls, _item):
@@ -1173,6 +1188,246 @@ class TestCoordinatorAndSensors(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*bg_tasks)
         self.assertEqual(fake_client.pnd_status_calls, 1)
         self.assertGreater(fake_client.pnd_calls, 0)
+
+    async def test_async_setup_entry_uses_portal_cache_and_defers_login_to_background(self) -> None:
+        fixed_now = datetime(2026, 4, 15, 10, 0, tzinfo=PRAGUE)
+        self.dt_util._now_override = fixed_now
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now.astimezone(tz) if tz else fixed_now.replace(tzinfo=None)
+
+        orig_dt = self.cez_coord.datetime
+        self.cez_coord.datetime = _FixedDatetime
+        self.addCleanup(setattr, self.cez_coord, "datetime", orig_dt)
+
+        recorder = _FakeRecorder()
+        hass = _FakeHass(recorder, currency="CZK")
+        hass.store_backing = {}
+        bg_tasks: list[asyncio.Task[Any]] = []
+
+        def _create_bg_task(coro, name):
+            task = asyncio.create_task(coro, name=name)
+            bg_tasks.append(task)
+            return task
+
+        hass.async_create_background_task = _create_bg_task
+
+        async def _forward(_entry, _platforms):
+            return True
+
+        hass.config_entries = types.SimpleNamespace(
+            async_forward_entry_setups=_forward,
+            async_update_entry=lambda *a, **kw: None,
+        )
+
+        ean = "859182400100000033"
+        signals_data = {
+            "signals": [
+                {"signal": "a3b7dp01", "datum": "13.04.2026", "casy": "00:00-06:00"},
+                {"signal": "a3b7dp01", "datum": "14.04.2026", "casy": "00:00-06:00"},
+            ]
+        }
+        pnd_values = (
+            _make_day_15min_values("2026-04-13", kw_value=2.0)
+            + _make_day_15min_values("2026-04-14", kw_value=2.0)
+        )
+
+        class _TrackingClient(_FakeApiClient):
+            def __init__(self) -> None:
+                super().__init__(
+                    pnd_values,
+                    readings=[{"datumOdectu": "2026-04-12", "stavVt": "100", "stavNt": "50"}],
+                    signals=signals_data,
+                    outages=[],
+                )
+                self.environment_options = []
+                self.preferred_environment_missing = False
+                self.login_calls = 0
+                self.portal_calls = 0
+
+            async def login(self) -> None:
+                self.login_calls += 1
+
+            async def async_close(self) -> None:
+                return None
+
+            async def get_readings(self, uid: str):
+                self.portal_calls += 1
+                return await super().get_readings(uid)
+
+            async def get_signals(self, e: str):
+                self.portal_calls += 1
+                return await super().get_signals(e)
+
+            async def get_outages(self, e: str):
+                self.portal_calls += 1
+                return await super().get_outages(e)
+
+        clients: list[_TrackingClient] = []
+
+        def _make_client(**_kw):
+            c = _TrackingClient()
+            clients.append(c)
+            return c
+
+        orig_client_cls = self.cez_init.CezDistribuceApiClient
+        orig_first_refresh = getattr(
+            self.cez_coord.CezDistribuceCoordinator, "async_config_entry_first_refresh", None
+        )
+
+        async def _first_refresh(coord_self):
+            coord_self.data = await coord_self._async_update_data()
+
+        self.cez_init.CezDistribuceApiClient = _make_client
+        self.cez_coord.CezDistribuceCoordinator.async_config_entry_first_refresh = _first_refresh
+        self.addCleanup(setattr, self.cez_init, "CezDistribuceApiClient", orig_client_cls)
+        if orig_first_refresh is None:
+            self.addCleanup(
+                delattr,
+                self.cez_coord.CezDistribuceCoordinator,
+                "async_config_entry_first_refresh",
+            )
+        else:
+            self.addCleanup(
+                setattr,
+                self.cez_coord.CezDistribuceCoordinator,
+                "async_config_entry_first_refresh",
+                orig_first_refresh,
+            )
+
+        entry = _FakeEntry(
+            entry_id="entry-cached",
+            title="Doma",
+            data={
+                self.cez_const.CONF_USERNAME: "u",
+                self.cez_const.CONF_PASSWORD: "p",
+                self.cez_const.CONF_EAN: ean,
+                "uid": "uid-33",
+                self.cez_const.CONF_PARTNER: "p-33",
+                self.cez_const.CONF_ANLAGE: "a-33",
+                self.cez_const.CONF_HDO_SIGNAL: "a3b7dp01",
+            },
+        )
+        entry.async_on_unload = lambda _cb: None
+
+        # 1st startup (cold, empty cache): performs synchronous login + portal fetch, saves cache
+        self.assertTrue(await self.cez_init.async_setup_entry(hass, entry))
+        self.assertEqual(clients[0].login_calls, 1)
+        self.assertEqual(clients[0].portal_calls, 3)
+        await asyncio.gather(*bg_tasks)
+        bg_tasks.clear()
+        self.assertIn(f"{self.cez_const.DOMAIN}.portal_cache.{ean}", hass.store_backing)
+
+        # 2nd startup (simulated HA restart with warm cache): ZERO network calls during setup!
+        self.assertTrue(await self.cez_init.async_setup_entry(hass, entry))
+        restarted_client = clients[1]
+        restarted_coord = hass.data[self.cez_const.DOMAIN][entry.entry_id]
+        self.assertEqual(restarted_client.login_calls, 0)
+        self.assertEqual(restarted_client.portal_calls, 0)
+        self.assertEqual(restarted_client.pnd_calls, 0)
+        # Entities already have valid data from cache + local Recorder!
+        self.assertIsNotNone(restarted_coord.data)
+        self.assertIn(self.cez_const.DATA_SIGNALS, restarted_coord.data)
+        self.assertIsNotNone(restarted_coord.last_successful_update)
+        self.assertIsNotNone(restarted_coord.monthly_consumption)
+        self.assertAlmostEqual(restarted_coord.monthly_consumption["total_kwh"], 96.0, places=3)
+        self.assertEqual(len(bg_tasks), 1)
+
+        # Background startup completes login + fresh portal refresh (and skips MEPAS via persisted throttle)
+        await asyncio.gather(*bg_tasks)
+        self.assertEqual(restarted_client.login_calls, 1)
+        self.assertEqual(restarted_client.portal_calls, 3)
+        self.assertEqual(restarted_client.pnd_calls, 0)
+
+    async def test_cached_startup_background_auth_error_triggers_reauth_and_outage_keeps_cache(self) -> None:
+        recorder = _FakeRecorder()
+        hass = _FakeHass(recorder, currency="CZK")
+        ean = "859182400100000034"
+        hass.store_backing = {
+            f"{self.cez_const.DOMAIN}.portal_cache.{ean}": {
+                "om_type": "S",
+                "last_successful_update": "2026-04-15T07:00:00+00:00",
+                "data": {
+                    self.cez_const.DATA_READINGS: [],
+                    self.cez_const.DATA_SIGNALS: {"signals": []},
+                    self.cez_const.DATA_OUTAGES: [],
+                },
+            }
+        }
+        bg_tasks: list[asyncio.Task[Any]] = []
+        hass.async_create_background_task = lambda coro, name: (
+            bg_tasks.append(t := asyncio.create_task(coro, name=name)) or t
+        )
+
+        async def _forward(_entry, _platforms):
+            return True
+
+        hass.config_entries = types.SimpleNamespace(
+            async_forward_entry_setups=_forward,
+            async_update_entry=lambda *a, **kw: None,
+        )
+        reauth_called: list[Any] = []
+        entry = _FakeEntry(
+            entry_id="entry-reauth",
+            title="Doma",
+            data={
+                self.cez_const.CONF_USERNAME: "u",
+                self.cez_const.CONF_PASSWORD: "bad",
+                self.cez_const.CONF_EAN: ean,
+                "uid": "uid-34",
+            },
+        )
+        entry.async_on_unload = lambda _cb: None
+        entry.async_start_reauth = reauth_called.append
+
+        login_exc: Exception = self.cez_api.CezInvalidCredentialsError("bad pass")
+
+        class _FailingLoginClient(_FakeApiClient):
+            def __init__(self) -> None:
+                super().__init__([])
+                self.environment_options = []
+                self.preferred_environment_missing = False
+
+            async def login(self) -> None:
+                raise login_exc
+
+            async def async_close(self) -> None:
+                return None
+
+        orig_client_cls = self.cez_init.CezDistribuceApiClient
+        self.cez_init.CezDistribuceApiClient = lambda **_kw: _FailingLoginClient()
+        self.addCleanup(setattr, self.cez_init, "CezDistribuceApiClient", orig_client_cls)
+
+        # Case 1: Invalid credentials in background -> triggers reauth
+        self.assertTrue(await self.cez_init.async_setup_entry(hass, entry))
+        await asyncio.gather(*bg_tasks)
+        bg_tasks.clear()
+        self.assertEqual(len(reauth_called), 1)
+
+        # Case 2: Transient outage in background -> does NOT trigger reauth, keeps cached data
+        reauth_called.clear()
+        login_exc = self.cez_api.CezPortalUnavailableError("night maintenance")
+        self.assertTrue(await self.cez_init.async_setup_entry(hass, entry))
+        await asyncio.gather(*bg_tasks)
+        self.assertEqual(len(reauth_called), 0)
+        coord = hass.data[self.cez_const.DOMAIN][entry.entry_id]
+        self.assertIn(self.cez_const.DATA_SIGNALS, coord.data)
+
+        # Verify lazy _ensure_auth_login in CezDistribuceApiClient when _api_token is None
+        api_client = self.cez_api.CezDistribuceApiClient(username="u", password="p")
+        lazy_logins = 0
+
+        async def _fake_login() -> None:
+            nonlocal lazy_logins
+            lazy_logins += 1
+            api_client._api_token = "fresh-tok"
+            api_client._auth_generation += 1
+
+        api_client.login = _fake_login  # type: ignore[method-assign]
+        await asyncio.gather(api_client._ensure_auth_login(), api_client._ensure_auth_login())
+        self.assertEqual(lazy_logins, 1)
 
 
 if __name__ == "__main__":

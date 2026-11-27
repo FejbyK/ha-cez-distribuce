@@ -97,6 +97,10 @@ HDO_HISTORY_STORAGE_VERSION = 1
 # posledního skenu děr a začátku historie) - přežije restart HA, takže
 # rychlý restart zbytečně znovu netahá MEPAS ani neskenuje 62 dní děr.
 PND_STATE_STORAGE_VERSION = 1
+# Cache posledních portálových dat (odečty, HDO signály, odstávky) - umožňuje
+# nastartovat integraci pod ~0,5 s z lokálního úložiště a provést přihlášení
+# i stažení čerstvých dat na pozadí.
+PORTAL_CACHE_STORAGE_VERSION = 1
 
 
 def _parse_utc_iso(raw: Any) -> datetime | None:
@@ -143,6 +147,9 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._hdo_history: dict[str, str] | None = None
         self._pnd_store: Store[dict[str, Any]] = Store(
             hass, PND_STATE_STORAGE_VERSION, f"{DOMAIN}.pnd_state.{ean}"
+        )
+        self._portal_cache_store: Store[dict[str, Any]] = Store(
+            hass, PORTAL_CACHE_STORAGE_VERSION, f"{DOMAIN}.portal_cache.{ean}"
         )
         self._pnd_state_loaded = False
         self._defer_initial_pnd_sync = defer_initial_pnd_sync
@@ -320,6 +327,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if all_fresh:
             self.last_successful_update = dt_util.utcnow()
+        self._schedule_save_portal_cache(merged_data)
 
         if not self._is_production:
             try:
@@ -353,6 +361,57 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
         return merged_data
+
+    def _schedule_save_portal_cache(self, data: dict[str, Any]) -> None:
+        """Odloženě uloží poslední portálová data pro rychlý start po restartu HA."""
+        snapshot = dict(data)
+        last_ok = (
+            self.last_successful_update.isoformat()
+            if self.last_successful_update
+            else None
+        )
+        om_type = self._om_type
+        self._portal_cache_store.async_delay_save(
+            lambda: {
+                "om_type": om_type,
+                "last_successful_update": last_ok,
+                "data": snapshot,
+            },
+            5,
+        )
+
+    async def async_hydrate_from_cache(self) -> bool:
+        """Načte uložená portálová data a lokální statistiky pro okamžitý start.
+
+        Vrací True, pokud byla nalezena použitelná cache a start může proběhnout
+        bez čekání na síť (přihlášení a čerstvý refresh pak doběhnou na pozadí).
+        """
+        try:
+            stored = await self._portal_cache_store.async_load()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Načtení cache portálových dat selhalo (%s).", err)
+            return False
+        if not isinstance(stored, dict):
+            return False
+        if stored.get("om_type") != self._om_type:
+            return False
+        cached_data = stored.get("data")
+        if not isinstance(cached_data, dict) or not cached_data:
+            return False
+        if not self._is_production and DATA_SIGNALS not in cached_data:
+            return False
+
+        self.data = dict(cached_data)
+        self.last_successful_update = _parse_utc_iso(stored.get("last_successful_update"))
+        self._defer_initial_pnd_sync = False
+        if not self._is_production:
+            try:
+                await self._async_update_hdo_history(self.data.get(DATA_SIGNALS))
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.debug("Načtení historie HDO při startu z cache selhalo (%s).", err)
+        if self._partner and self._anlage:
+            await self._async_hydrate_pnd_from_recorder(self.data)
+        return True
 
     async def _async_load_pnd_state(self) -> None:
         """Jednou po startu načte uložené časy PND synchronizace ze Store."""

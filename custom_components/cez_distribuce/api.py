@@ -610,11 +610,18 @@ class CezDistribuceApiClient:
 
         _LOGGER.debug("Přihlášení OK, token načten.")
 
+    async def _ensure_auth_login(self, *, failed_generation: int | None = None) -> None:
+        """Zajistí platné přihlášení k portálu bezpečně vůči souběžným požadavkům."""
+        async with self._login_lock:
+            if failed_generation is None and self._api_token:
+                return
+            if failed_generation is not None and self._auth_generation != failed_generation:
+                return
+            await self.login()
+
     async def _ensure_auth_relogin(self, failed_generation: int) -> None:
         """Provede re-login nejvýše jednou pro danou generaci tokenu."""
-        async with self._login_lock:
-            if self._auth_generation == failed_generation:
-                await self.login()
+        await self._ensure_auth_login(failed_generation=failed_generation)
 
     async def _ensure_anon_token(self, *, failed_generation: int | None = None) -> None:
         """Líně načte (nebo obnoví) anonymní token pro veřejné portálové dotazy."""
@@ -1158,7 +1165,9 @@ class CezDistribuceApiClient:
                 attempt + 1,
                 LOGIN_RETRIES,
             )
-            if not authenticated and not self._anon_api_token:
+            if authenticated and not self._api_token:
+                await self._ensure_auth_login()
+            elif not authenticated and not self._anon_api_token:
                 await self._ensure_anon_token()
 
             headers = {}

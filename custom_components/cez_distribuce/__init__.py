@@ -1,7 +1,9 @@
 """ČEZ integrace pro Home Assistant."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 from typing import Any, Coroutine
 
 import aiohttp
@@ -223,8 +225,73 @@ async def _async_ensure_portal_environment(
     _LOGGER.info("Prostředí portálu ČEZ uloženo do konfigurace (%s).", environment[0])
 
 
+async def _async_background_startup(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    client: CezDistribuceApiClient,
+    coordinator: CezDistribuceCoordinator,
+    uid: str,
+    ean: str,
+    partner: str,
+    anlage: str,
+) -> None:
+    """Provede přihlášení k portálu a první aktualizaci na pozadí po startu z cache."""
+    t0 = time.monotonic()
+    try:
+        ensure_login = getattr(client, "_ensure_auth_login", None)
+        if callable(ensure_login):
+            await ensure_login()
+        else:
+            await client.login()
+    except asyncio.CancelledError:
+        raise
+    except CezInvalidCredentialsError as err:
+        _LOGGER.warning("Přihlášení do ČEZ selhalo (%s); spouštím re-autorizaci.", err)
+        start_reauth = getattr(entry, "async_start_reauth", None)
+        if callable(start_reauth):
+            start_reauth(hass)
+        return
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning(
+            "Portál ČEZ je při startu nedostupný (%s); ponechávám uložená data "
+            "z cache a zkusím znovu v příštím cyklu.",
+            err,
+        )
+        return
+
+    t_login = time.monotonic()
+    try:
+        await _async_ensure_portal_environment(hass, entry, client, uid, ean)
+    except asyncio.CancelledError:
+        raise
+    except Exception as err:  # noqa: BLE001
+        _LOGGER.warning("Dohledání prostředí portálu ČEZ na pozadí selhalo: %s", err)
+        return
+
+    t_env = time.monotonic()
+    try:
+        await coordinator.async_refresh()
+        if not partner or not anlage:
+            await _async_enrich_partner_and_anlage(hass, entry, client, coordinator, uid)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        _LOGGER.exception("Úvodní aktualizace ČEZ na pozadí selhala.")
+        return
+
+    t_done = time.monotonic()
+    _LOGGER.debug(
+        "Start ČEZ na pozadí dokončen za %.2f s (login=%.2f s, prostředí=%.2f s, refresh+PND=%.2f s).",
+        t_done - t0,
+        t_login - t0,
+        t_env - t_login,
+        t_done - t_env,
+    )
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Nastaví integraci z config entry."""
+    t_start = time.monotonic()
     username = entry.data[CONF_USERNAME]
     password = entry.data[CONF_PASSWORD]
     ean = entry.data[CONF_EAN]
@@ -258,24 +325,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         ssl_context=ssl_context,
     )
 
-    try:
-        await client.login()
-    except CezInvalidCredentialsError as err:
-        await client.async_close()
-        raise ConfigEntryAuthFailed(str(err)) from err
-    except Exception as err:
-        # Síť, timeout, změna přihlašovacího toku nebo mezikrok portálu
-        # (podmínky, smlouva) - HA to zkusí znovu s rostoucím odstupem.
-        await client.async_close()
-        raise ConfigEntryNotReady(f"Přihlášení do ČEZ selhalo: {err}") from err
-
-    entry.async_on_unload(client.async_close)
-    try:
-        await _async_ensure_portal_environment(hass, entry, client, uid, ean)
-    except Exception:
-        await client.async_close()
-        raise
-    _LOGGER.debug("Přihlášení config entry dokončeno; pokračuji načtením dat.")
     partner = entry.data.get(CONF_PARTNER, "")
     anlage = entry.data.get(CONF_ANLAGE, "")
     hdo_signal = entry.options.get(
@@ -307,8 +356,63 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         on_uid_changed=_store_new_uid,
         defer_initial_pnd_sync=bool(partner and anlage),
     )
+
+    # Rychlá cesta při restartu HA: pokud existuje lokální cache portálových dat,
+    # naplníme entity ihned z disku + Recorderu (< 0,5 s) a přihlášení i čerstvé
+    # stažení dat z ČEZ provedeme na pozadí bez blokování startu HA.
+    if await coordinator.async_hydrate_from_cache():
+        t_cache = time.monotonic()
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+        _async_register_services(hass)
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        bg_task = _async_create_background_task(
+            hass,
+            _async_background_startup(
+                hass, entry, client, coordinator, uid, ean, partner, anlage
+            ),
+            name=f"{DOMAIN} background startup {ean}",
+        )
+        entry.async_on_unload(bg_task.cancel)
+        entry.async_on_unload(client.async_close)
+        _LOGGER.debug(
+            "Start ČEZ z cache dokončen za %.2f s (hydratace=%.2f s); "
+            "přihlášení a aktualizace běží na pozadí.",
+            time.monotonic() - t_start,
+            t_cache - t_start,
+        )
+        return True
+
+    # První spuštění (bez cache): synchronní přihlášení a načtení portálových dat,
+    # aby se spolehlivě rozpoznal typ tarifu (jednotarif vs. HDO) a ověřilo heslo.
+    try:
+        await client.login()
+    except CezInvalidCredentialsError as err:
+        await client.async_close()
+        raise ConfigEntryAuthFailed(str(err)) from err
+    except Exception as err:
+        # Síť, timeout, změna přihlašovacího toku nebo mezikrok portálu
+        # (podmínky, smlouva) - HA to zkusí znovu s rostoucím odstupem.
+        await client.async_close()
+        raise ConfigEntryNotReady(f"Přihlášení do ČEZ selhalo: {err}") from err
+
+    entry.async_on_unload(client.async_close)
+    try:
+        await _async_ensure_portal_environment(hass, entry, client, uid, ean)
+    except Exception:
+        await client.async_close()
+        raise
+    t_login = time.monotonic()
+    _LOGGER.debug(
+        "Přihlášení config entry dokončeno za %.2f s; pokračuji načtením dat.",
+        t_login - t_start,
+    )
+
     await coordinator.async_config_entry_first_refresh()
-    _LOGGER.debug("První načtení dat config entry dokončeno.")
+    t_refresh = time.monotonic()
+    _LOGGER.debug(
+        "První načtení dat config entry dokončeno za %.2f s.",
+        t_refresh - t_login,
+    )
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
     _async_register_services(hass)
@@ -331,6 +435,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         entry.async_on_unload(task.cancel)
         _LOGGER.debug("Dohledání metadat hodinových dat běží na pozadí.")
+    _LOGGER.debug(
+        "První start ČEZ bez cache dokončen za %.2f s.",
+        time.monotonic() - t_start,
+    )
     return True
 
 
