@@ -15,8 +15,11 @@ from typing import Any
 import aiohttp
 from bs4 import BeautifulSoup
 
-try:
-    # Jako součást HA balíčku custom_components.cez_distribuce
+if __package__:
+    # Jako součást HA balíčku custom_components.cez_distribuce.
+    # Podmínka přes __package__ místo try/except ImportError zajistí, že se
+    # případná chyba importu .const v HA nezamaskuje zavádějícím
+    # "No module named 'const'".
     from .const import (
         APP_BUILD_NUMBER,
         APP_VERSION,
@@ -26,7 +29,7 @@ try:
         MEPAS_SCOPE,
         MEPAS_TOKEN_URL,
     )
-except ImportError:
+else:
     # Samostatně (diagnostické skripty ve scripts/) - const.py leží ve
     # stejné složce, nebo je natažen přes importlib.
     from const import (

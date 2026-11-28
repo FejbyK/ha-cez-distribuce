@@ -17,12 +17,83 @@
         }
       },
       "select_hdo_signal": {
-        "title": "Vyberte HDO signál",
-        "description": "Bylo nalezeno {signal_count} HDO signálů. Vyberte ten, který odpovídá vašemu tarifu (najdete ho ve smlouvě nebo na faktuře).",
+        "title": "HDO signál, ceny a funkce",
+        "description": "Bylo nalezeno {signal_count} HDO povelů. Vyberte ten, který odpovídá vašemu tarifu (kód najdete ve smlouvě, na faktuře nebo porovnejte časy nízkého tarifu níže):\n\n{signals_overview}",
         "data": {
           "hdo_signal": "Kód HDO signálu",
           "price_vt": "Cena VT (Kč/kWh)",
-          "price_nt": "Cena NT (Kč/kWh)"
+          "price_nt": "Cena NT (Kč/kWh)",
+          "enable_hdo": "HDO a tarify",
+          "enable_readings": "Odečty elektroměru",
+          "enable_outages": "Poruchy a odstávky",
+          "enable_pnd": "Hodinová data a spotřeba (PND)",
+          "enable_costs": "Ceny a náklady"
+        },
+        "data_description": {
+          "hdo_signal": "Kód HDO povelu podle vaší smlouvy nebo podle přehledu časů výše.",
+          "price_vt": "Celková cena za 1 kWh ve vysokém tarifu (včetně distribuce a DPH).",
+          "price_nt": "Celková cena za 1 kWh v nízkém tarifu (včetně distribuce a DPH).",
+          "enable_hdo": "Stav HDO, plán spínání, začátky/konce a binární senzory NT/VT (podzařízení HDO a tarify).",
+          "enable_readings": "Stavy elektroměru VT/NT, celková spotřeba a odhad elektroměru (hlavní zařízení).",
+          "enable_outages": "Binární senzor plánovaných odstávek a poruch v síti (hlavní zařízení).",
+          "enable_pnd": "15min/hodinová data z aplikace Proud, statistiky Energy, měsíční a denní spotřeba (podzařízení Spotřeba).",
+          "enable_costs": "Aktuální cena elektřiny, měsíční náklady a nákladové statistiky (podzařízení Ceny a náklady)."
+        },
+        "sections": {
+          "features": {
+            "name": "Aktivní funkce a senzory",
+            "description": "Vyberte, které skupiny funkcí a podzařízení chcete zapnout. Vypnuté funkce nestahují data z API.",
+            "data": {
+              "enable_hdo": "HDO a tarify",
+              "enable_readings": "Odečty elektroměru",
+              "enable_outages": "Poruchy a odstávky",
+              "enable_pnd": "Hodinová data a spotřeba (PND)",
+              "enable_costs": "Ceny a náklady"
+            },
+            "data_description": {
+              "enable_hdo": "Stav HDO, plán spínání, začátky/konce a binární senzory NT/VT (podzařízení HDO a tarify).",
+              "enable_readings": "Stavy elektroměru VT/NT, celková spotřeba a odhad elektroměru (hlavní zařízení).",
+              "enable_outages": "Binární senzor plánovaných odstávek a poruch v síti (hlavní zařízení).",
+              "enable_pnd": "15min/hodinová data z aplikace Proud, statistiky Energy, měsíční a denní spotřeba (podzařízení Spotřeba).",
+              "enable_costs": "Aktuální cena elektřiny, měsíční náklady a nákladové statistiky (podzařízení Ceny a náklady)."
+            }
+          }
+        }
+      },
+      "configure_features": {
+        "title": "Funkce integrace",
+        "description": "Zvolte, které funkce a senzory má integrace pro toto odběrné místo aktivovat. Nastavení lze kdykoliv změnit přes Konfigurovat.",
+        "data": {
+          "price_vt": "Cena elektřiny (Kč/kWh)",
+          "enable_readings": "Odečty elektroměru",
+          "enable_outages": "Poruchy a odstávky",
+          "enable_pnd": "Hodinová data a spotřeba (PND)",
+          "enable_costs": "Ceny a náklady"
+        },
+        "data_description": {
+          "price_vt": "Celková cena za 1 kWh (včetně distribuce a DPH).",
+          "enable_readings": "Stavy elektroměru, celková spotřeba a odhad elektroměru (hlavní zařízení).",
+          "enable_outages": "Binární senzor plánovaných odstávek a poruch v síti (hlavní zařízení).",
+          "enable_pnd": "15min/hodinová data z aplikace Proud, statistiky Energy, měsíční a denní spotřeba / dodávka.",
+          "enable_costs": "Aktuální cena elektřiny, měsíční náklady a nákladové statistiky (podzařízení Ceny a náklady)."
+        },
+        "sections": {
+          "features": {
+            "name": "Aktivní funkce a senzory",
+            "description": "Vyberte, které skupiny funkcí chcete zapnout. Vypnuté funkce nestahují data z API.",
+            "data": {
+              "enable_readings": "Odečty elektroměru",
+              "enable_outages": "Poruchy a odstávky",
+              "enable_pnd": "Hodinová data a spotřeba (PND)",
+              "enable_costs": "Ceny a náklady"
+            },
+            "data_description": {
+              "enable_readings": "Stavy elektroměru, celková spotřeba a odhad elektroměru (hlavní zařízení).",
+              "enable_outages": "Binární senzor plánovaných odstávek a poruch v síti (hlavní zařízení).",
+              "enable_pnd": "15min/hodinová data z aplikace Proud, statistiky Energy, měsíční a denní spotřeba / dodávka.",
+              "enable_costs": "Aktuální cena elektřiny, měsíční náklady a nákladové statistiky (podzařízení Ceny a náklady)."
+            }
+          }
         }
       },
       "reauth_confirm": {
@@ -48,7 +119,8 @@
       "portal_action_required": "Portál ČEZ Distribuce po přihlášení vyžaduje akci (potvrzení podmínek, smlouvy nebo výběr prostředí). Přihlaste se jednou na dip.cezdistribuce.cz v prohlížeči a zkuste to znovu.",
       "supply_point_not_found": "Odběrné místo této integrace není pod tímto účtem vidět v žádném prostředí portálu.",
       "portal_unavailable": "Portál ČEZ Distribuce je dočasně nedostupný (místo dat vrací úvodní stránku, typicky při noční údržbě). Zkuste to prosím znovu za chvíli.",
-      "portal_no_data_access": "Přihlášení proběhlo, ale portál ČEZ Distribuce pro tento účet nevrací žádná odběrná místa. Ověřte, že po přihlášení na dip.cezdistribuce.cz v prohlížeči vidíte svá odběrná místa. Samotný účet Můj ČEZ (ČEZ Prodej) nestačí a odběrné místo musí ležet v distribučním území ČEZ Distribuce (ne PREdistribuce ani EG.D)."
+      "portal_no_data_access": "Přihlášení proběhlo, ale portál ČEZ Distribuce pro tento účet nevrací žádná odběrná místa. Ověřte, že po přihlášení na dip.cezdistribuce.cz v prohlížeči vidíte svá odběrná místa. Samotný účet Můj ČEZ (ČEZ Prodej) nestačí a odběrné místo musí ležet v distribučním území ČEZ Distribuce (ne PREdistribuce ani EG.D).",
+      "no_features_enabled": "Musí zůstat zapnutá alespoň jedna funkce integrace."
     },
     "abort": {
       "already_configured": "Toto odběrné místo (EAN) je již nakonfigurováno.",
@@ -59,14 +131,52 @@
   "options": {
     "step": {
       "init": {
-        "title": "Tarif a ceny elektřiny",
-        "description": "Nastavení HDO signálu a cen pro senzor Aktuální cena, měsíční náklady a dlouhodobé statistiky. Po uložení se integrace znovu načte.",
+        "title": "Funkce, tarif a ceny elektřiny",
+        "description": "Nastavení aktivních funkcí integrace, HDO signálu a cen elektřiny. Vypnuté funkce přeskočí své dotazy na API a jejich entity i prázdná podzařízení se automaticky odeberou. Po uložení se integrace znovu načte.{signals_overview}",
         "data": {
           "hdo_signal": "Kód HDO signálu",
           "price_vt": "Cena VT (Kč/kWh)",
-          "price_nt": "Cena NT (Kč/kWh)"
+          "price_nt": "Cena NT (Kč/kWh)",
+          "enable_hdo": "HDO a tarify",
+          "enable_readings": "Odečty elektroměru",
+          "enable_outages": "Poruchy a odstávky",
+          "enable_pnd": "Hodinová data a spotřeba (PND)",
+          "enable_costs": "Ceny a náklady"
+        },
+        "data_description": {
+          "hdo_signal": "Kód HDO povelu podle vaší smlouvy nebo podle přehledu časů výše.",
+          "price_vt": "Celková cena za 1 kWh ve vysokém tarifu (včetně distribuce a DPH).",
+          "price_nt": "Celková cena za 1 kWh v nízkém tarifu (včetně distribuce a DPH).",
+          "enable_hdo": "Stav HDO, plán spínání, začátky/konce a binární senzory NT/VT (podzařízení HDO a tarify).",
+          "enable_readings": "Stavy elektroměru VT/NT, celková spotřeba a odhad elektroměru (hlavní zařízení).",
+          "enable_outages": "Binární senzor plánovaných odstávek a poruch v síti (hlavní zařízení).",
+          "enable_pnd": "15min/hodinová data z aplikace Proud, statistiky Energy, měsíční a denní spotřeba (podzařízení Spotřeba).",
+          "enable_costs": "Aktuální cena elektřiny, měsíční náklady a nákladové statistiky (podzařízení Ceny a náklady)."
+        },
+        "sections": {
+          "features": {
+            "name": "Aktivní funkce a senzory",
+            "description": "Vyberte, které skupiny funkcí a podzařízení mají být aktivní. Vypnuté funkce nestahují data z API.",
+            "data": {
+              "enable_hdo": "HDO a tarify",
+              "enable_readings": "Odečty elektroměru",
+              "enable_outages": "Poruchy a odstávky",
+              "enable_pnd": "Hodinová data a spotřeba (PND)",
+              "enable_costs": "Ceny a náklady"
+            },
+            "data_description": {
+              "enable_hdo": "Stav HDO, plán spínání, začátky/konce a binární senzory NT/VT (podzařízení HDO a tarify).",
+              "enable_readings": "Stavy elektroměru VT/NT, celková spotřeba a odhad elektroměru (hlavní zařízení).",
+              "enable_outages": "Binární senzor plánovaných odstávek a poruch v síti (hlavní zařízení).",
+              "enable_pnd": "15min/hodinová data z aplikace Proud, statistiky Energy, měsíční a denní spotřeba (podzařízení Spotřeba).",
+              "enable_costs": "Aktuální cena elektřiny, měsíční náklady a nákladové statistiky (podzařízení Ceny a náklady)."
+            }
+          }
         }
       }
+    },
+    "error": {
+      "no_features_enabled": "Musí zůstat zapnutá alespoň jedna funkce integrace."
     }
   },
   "services": {

@@ -12,6 +12,30 @@ CONF_PRICE_NT = "price_nt"
 DEFAULT_PRICE_VT = 3.30
 DEFAULT_PRICE_NT = 2.60
 
+# Přepínače volitelných funkcí integrace (zpětně kompatibilní výchozí hodnota True).
+CONF_ENABLE_HDO = "enable_hdo"
+CONF_ENABLE_READINGS = "enable_readings"
+CONF_ENABLE_OUTAGES = "enable_outages"
+CONF_ENABLE_PND = "enable_pnd"
+CONF_ENABLE_COSTS = "enable_costs"
+
+DEFAULT_ENABLE_HDO = True
+DEFAULT_ENABLE_READINGS = True
+DEFAULT_ENABLE_OUTAGES = True
+DEFAULT_ENABLE_PND = True
+DEFAULT_ENABLE_COSTS = True
+
+# Logické podskupiny zařízení v HA (propojené přes via_device na hlavní
+# elektroměr, aby 25+ entit nebylo v jednom nepřehledném seznamu).
+DEVICE_GROUP_HDO = "hdo"
+DEVICE_GROUP_CONSUMPTION = "consumption"
+DEVICE_GROUP_COSTS = "costs"
+DEVICE_SUBGROUPS = (
+    DEVICE_GROUP_HDO,
+    DEVICE_GROUP_CONSUMPTION,
+    DEVICE_GROUP_COSTS,
+)
+
 # Typ odběrného místa (pole "typ" v odpovědi get_supply_points, viz enum
 # "typyOM"). Běžná spotřeba je "S" - integrace se historicky chovala, jako
 # by žádný jiný typ neexistoval. Výroba/mikrozdroj (FVE apod.) má vlastní

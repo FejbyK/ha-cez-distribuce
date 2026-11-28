@@ -178,6 +178,43 @@ class TestHdoSplit(unittest.TestCase):
         self.assertIn("2026-04-01", history)
         self.assertEqual(history["2026-04-02"], "00:00-08:00")
 
+    def test_summarize_hdo_signals_and_options_labels(self) -> None:
+        signals_data = {
+            "signals": [
+                {"signal": "a3b7dp01", "datum": "15.04.2026", "casy": "00:00-06:00;22:00-24:00"},
+                {"signal": "a3b7dp01", "datum": "16.04.2026", "casy": "00:00-05:00"},
+                {"signal": "a1b6dp02", "datum": "15.04.2026", "casy": "00:00-06:30;13:00-15:00"},
+                {"signal": "a9w1dp03", "datum": "15.04.2026", "casy": ""},
+                {"signal": "a9w1dp03", "datum": "18.04.2026", "casy": "00:00-24:00"},
+                {"signal": "a0empty04", "datum": "15.04.2026", "casy": ""},
+            ]
+        }
+        options_cs, md_cs = hdo_split.build_hdo_signal_options(
+            signals_data,
+            today=date(2026, 4, 15),
+            language="cs",
+            extra_codes=("legacy_code",),
+        )
+        self.assertEqual(
+            list(options_cs.keys()),
+            ["legacy_code", "a3b7dp01", "a1b6dp02", "a9w1dp03", "a0empty04"],
+        )
+        self.assertEqual(options_cs["legacy_code"], "legacy_code")
+        self.assertIn("00:00-06:00, 22:00-24:00", options_cs["a3b7dp01"])
+        self.assertIn("8 h NT", options_cs["a3b7dp01"])
+        self.assertIn("8 h 30 min NT", options_cs["a1b6dp02"])
+        self.assertIn("dnes bez NT", options_cs["a9w1dp03"])
+        self.assertIn("18.04.: 00:00-24:00, 24 h NT", options_cs["a9w1dp03"])
+        self.assertIn("bez NT", options_cs["a0empty04"])
+        self.assertIn("**a3b7dp01**", md_cs)
+        self.assertIn("`00:00-06:00, 22:00-24:00`", md_cs)
+
+        options_en, _ = hdo_split.build_hdo_signal_options(
+            signals_data, today=date(2026, 4, 15), language="en"
+        )
+        self.assertIn("no NT today", options_en["a9w1dp03"])
+        self.assertIn("no NT", options_en["a0empty04"])
+
 
 if __name__ == "__main__":
     unittest.main()

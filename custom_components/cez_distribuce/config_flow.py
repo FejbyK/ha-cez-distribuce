@@ -10,6 +10,12 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
+from homeassistant.util import dt as dt_util
+
+try:
+    from homeassistant.data_entry_flow import section as flow_section
+except ImportError:
+    flow_section = None  # type: ignore[assignment]
 
 try:
     from homeassistant.util.ssl import get_default_context
@@ -28,6 +34,11 @@ from .api import (
 from .const import (
     CONF_ANLAGE,
     CONF_EAN,
+    CONF_ENABLE_COSTS,
+    CONF_ENABLE_HDO,
+    CONF_ENABLE_OUTAGES,
+    CONF_ENABLE_PND,
+    CONF_ENABLE_READINGS,
     CONF_HDO_SIGNAL,
     CONF_OM_TYPE,
     CONF_PARTNER,
@@ -38,12 +49,19 @@ from .const import (
     CONF_PRICE_VT,
     CONF_USERNAME,
     DATA_SIGNALS,
+    DEFAULT_ENABLE_COSTS,
+    DEFAULT_ENABLE_HDO,
+    DEFAULT_ENABLE_OUTAGES,
+    DEFAULT_ENABLE_PND,
+    DEFAULT_ENABLE_READINGS,
     DEFAULT_PRICE_NT,
     DEFAULT_PRICE_VT,
     DOMAIN,
     OM_TYPE_CONSUMPTION,
+    OM_TYPES_PRODUCTION,
     PORTAL_ENVIRONMENT_NAMES,
 )
+from .hdo_split import build_hdo_signal_options
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +71,75 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
         vol.Required(CONF_PASSWORD): str,
     }
 )
+
+_CONSUMPTION_FEATURE_DEFAULTS: tuple[tuple[str, bool], ...] = (
+    (CONF_ENABLE_HDO, DEFAULT_ENABLE_HDO),
+    (CONF_ENABLE_READINGS, DEFAULT_ENABLE_READINGS),
+    (CONF_ENABLE_OUTAGES, DEFAULT_ENABLE_OUTAGES),
+    (CONF_ENABLE_PND, DEFAULT_ENABLE_PND),
+    (CONF_ENABLE_COSTS, DEFAULT_ENABLE_COSTS),
+)
+_PRODUCTION_FEATURE_DEFAULTS: tuple[tuple[str, bool], ...] = (
+    (CONF_ENABLE_OUTAGES, DEFAULT_ENABLE_OUTAGES),
+    (CONF_ENABLE_PND, DEFAULT_ENABLE_PND),
+)
+SECTION_FEATURES = "features"
+
+
+def _hass_language(hass: Any) -> str:
+    config = getattr(hass, "config", None)
+    lang = getattr(config, "language", None) or "cs"
+    return "cs" if str(lang).lower().startswith("cs") else "en"
+
+
+def _entry_feature_enabled(
+    entry: config_entries.ConfigEntry, key: str, default: bool = True
+) -> bool:
+    return bool(entry.options.get(key, entry.data.get(key, default)))
+
+
+def _has_any_enabled_feature(
+    values: Mapping[str, Any], is_production: bool, *, include_hdo: bool = True
+) -> bool:
+    if is_production:
+        return any(bool(values.get(k, d)) for k, d in _PRODUCTION_FEATURE_DEFAULTS)
+    keys = [
+        (k, d)
+        for k, d in _CONSUMPTION_FEATURE_DEFAULTS
+        if include_hdo or k != CONF_ENABLE_HDO
+    ]
+    return any(bool(values.get(k, d)) for k, d in keys)
+
+
+def _extract_feature_inputs(user_input: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Podporuje jak vnořenou sekci 'features' (HA 2024.4+), tak ploché klíče."""
+    nested = user_input.get(SECTION_FEATURES)
+    if isinstance(nested, Mapping):
+        return nested
+    return user_input
+
+
+def _build_features_schema_fields(
+    feature_defs: tuple[tuple[str, bool], ...],
+    defaults: Mapping[str, Any],
+    fallback_values: Mapping[str, bool] | None = None,
+) -> dict[Any, Any]:
+    feature_inputs = _extract_feature_inputs(defaults)
+    inner: dict[Any, Any] = {}
+    for key, default in feature_defs:
+        fallback = (
+            fallback_values[key]
+            if fallback_values is not None and key in fallback_values
+            else default
+        )
+        inner[vol.Required(key, default=bool(feature_inputs.get(key, fallback)))] = bool
+    if flow_section is not None:
+        return {
+            vol.Required(SECTION_FEATURES): flow_section(
+                vol.Schema(inner), {"collapsed": False}
+            )
+        }
+    return inner
 
 
 class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -72,6 +159,7 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._selected_om_type: str = ""
         self._selected_environment: tuple[str, str] | None = None
         self._hdo_signals: list[str] = []
+        self._signals_data: Any = None
         self._client: CezDistribuceApiClient | None = None
 
     @staticmethod
@@ -85,10 +173,8 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @classmethod
     @callback
     def async_supports_options_flow(cls, config_entry: config_entries.ConfigEntry) -> bool:
-        """Ceny VT/NT dávají smysl jen u běžné spotřeby - výroba/mikrozdroj
-        (FVE) cenový senzor nemá (issue #24)."""
-        om_type = config_entry.data.get(CONF_OM_TYPE) or OM_TYPE_CONSUMPTION
-        return om_type == OM_TYPE_CONSUMPTION
+        """Možnosti integrace (funkce, u spotřeby i HDO a ceny) jsou dostupné pro všechna OM."""
+        return True
 
     @staticmethod
     def _login_error_key(err: Exception) -> str:
@@ -212,40 +298,33 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_select_hdo_signal(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """Výběr kódu HDO signálu (např. a3b7dp01)."""
+        """Výběr kódu HDO signálu se spínacími časy, cen a funkcí integrace."""
         errors: dict[str, str] = {}
 
-        if user_input is not None:
-            return await self._async_create_entry(
-                user_input[CONF_HDO_SIGNAL],
-                user_input[CONF_PRICE_VT],
-                user_input[CONF_PRICE_NT],
-            )
+        is_production = (
+            self._selected_om_type or OM_TYPE_CONSUMPTION
+        ) in OM_TYPES_PRODUCTION
 
         # HDO/tarify se týkají jen běžné spotřeby ("S") - odběrné místo
         # výroby/mikrozdroje (FVE, typ "V"/"M"/"B") žádný spínací signál nemá,
-        # zbytečně by se jen logovala chyba/prázdný výsledek. Rovnou
-        # přeskočíme na vytvoření entry bez HDO signálu (viz issue #24 -
-        # dodávka do sítě).
-        if self._selected_om_type and self._selected_om_type != OM_TYPE_CONSUMPTION:
+        # pokračujeme rovnou na výběr funkcí (issue #24).
+        if is_production:
             self._hdo_signals = []
-        elif not self._hdo_signals:
+            self._signals_data = None
+            return await self.async_step_configure_features()
+
+        if self._signals_data is None and not self._hdo_signals:
             try:
                 client = await self._async_get_client()
                 if self._selected_environment:
                     await client.select_environment(*self._selected_environment)
-                signals_data = await client.get_signals(self._selected_ean)
-                signal_list = (
-                    signals_data.get("signals", [])
-                    if isinstance(signals_data, dict)
-                    else []
+                self._signals_data = await client.get_signals(self._selected_ean)
+                options_loaded, _ = build_hdo_signal_options(
+                    self._signals_data,
+                    today=dt_util.now().date(),
+                    language=_hass_language(self.hass),
                 )
-                seen: set[str] = set()
-                for item in signal_list:
-                    code = item.get("signal", "")
-                    if code and code not in seen:
-                        seen.add(code)
-                        self._hdo_signals.append(code)
+                self._hdo_signals = list(options_loaded.keys())
                 _LOGGER.debug(
                     "Config flow: načteno HDO signálů=%d.",
                     len(self._hdo_signals),
@@ -253,24 +332,111 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             except Exception:
                 _LOGGER.exception("Nepodařilo se načíst HDO signály.")
 
-        # Pokud nejsou žádné signály, přeskočíme krok
+        # Jednotarifní OM bez HDO signálů -> výběr funkcí a ceny VT
         if not self._hdo_signals:
-            return await self._async_create_entry("", DEFAULT_PRICE_VT, DEFAULT_PRICE_NT)
+            return await self.async_step_configure_features()
 
-        options = {s: s for s in self._hdo_signals}
+        options, signals_overview = build_hdo_signal_options(
+            self._signals_data,
+            today=dt_util.now().date(),
+            language=_hass_language(self.hass),
+            extra_codes=self._hdo_signals,
+        )
+
+        if user_input is not None:
+            feature_inputs = _extract_feature_inputs(user_input)
+            features = {
+                k: bool(feature_inputs.get(k, d))
+                for k, d in _CONSUMPTION_FEATURE_DEFAULTS
+            }
+            if not _has_any_enabled_feature(features, is_production=False):
+                errors["base"] = "no_features_enabled"
+            else:
+                return await self._async_create_entry(
+                    user_input[CONF_HDO_SIGNAL],
+                    user_input[CONF_PRICE_VT],
+                    user_input[CONF_PRICE_NT],
+                    features=features,
+                )
 
         _LOGGER.debug(
             "Config flow: zobrazuji výběr HDO signálu, možností=%d.",
             len(options),
         )
+        defaults = user_input or {}
         return self.async_show_form(
             step_id="select_hdo_signal",
             data_schema=vol.Schema({
-                vol.Required(CONF_HDO_SIGNAL, default=self._hdo_signals[0]): vol.In(options),
-                vol.Required(CONF_PRICE_VT, default=DEFAULT_PRICE_VT): vol.Coerce(float),
-                vol.Required(CONF_PRICE_NT, default=DEFAULT_PRICE_NT): vol.Coerce(float),
+                vol.Required(
+                    CONF_HDO_SIGNAL,
+                    default=defaults.get(CONF_HDO_SIGNAL, self._hdo_signals[0]),
+                ): vol.In(options),
+                vol.Required(
+                    CONF_PRICE_VT,
+                    default=float(defaults.get(CONF_PRICE_VT, DEFAULT_PRICE_VT)),
+                ): vol.All(vol.Coerce(float), vol.Range(min=0)),
+                vol.Required(
+                    CONF_PRICE_NT,
+                    default=float(defaults.get(CONF_PRICE_NT, DEFAULT_PRICE_NT)),
+                ): vol.All(vol.Coerce(float), vol.Range(min=0)),
+                **_build_features_schema_fields(
+                    _CONSUMPTION_FEATURE_DEFAULTS, defaults
+                ),
             }),
-            description_placeholders={"signal_count": str(len(self._hdo_signals))},
+            description_placeholders={
+                "signal_count": str(len(options)),
+                "signals_overview": signals_overview,
+            },
+            errors=errors,
+        )
+
+    async def async_step_configure_features(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Výběr aktivních funkcí pro jednotarifní nebo výrobní (FVE) odběrné místo."""
+        errors: dict[str, str] = {}
+        is_production = (
+            self._selected_om_type or OM_TYPE_CONSUMPTION
+        ) in OM_TYPES_PRODUCTION
+        feature_defs = (
+            _PRODUCTION_FEATURE_DEFAULTS
+            if is_production
+            else tuple(
+                (k, d) for k, d in _CONSUMPTION_FEATURE_DEFAULTS if k != CONF_ENABLE_HDO
+            )
+        )
+
+        if user_input is not None:
+            feature_inputs = _extract_feature_inputs(user_input)
+            features = {k: bool(feature_inputs.get(k, d)) for k, d in feature_defs}
+            if not _has_any_enabled_feature(
+                features, is_production=is_production, include_hdo=False
+            ):
+                errors["base"] = "no_features_enabled"
+            else:
+                price_vt = (
+                    float(user_input.get(CONF_PRICE_VT, DEFAULT_PRICE_VT))
+                    if not is_production
+                    else DEFAULT_PRICE_VT
+                )
+                return await self._async_create_entry(
+                    "", price_vt, DEFAULT_PRICE_NT, features=features
+                )
+
+        defaults = user_input or {}
+        schema_fields: dict[Any, Any] = {}
+        if not is_production:
+            schema_fields[
+                vol.Required(
+                    CONF_PRICE_VT,
+                    default=float(defaults.get(CONF_PRICE_VT, DEFAULT_PRICE_VT)),
+                )
+            ] = vol.All(vol.Coerce(float), vol.Range(min=0))
+        schema_fields.update(_build_features_schema_fields(feature_defs, defaults))
+
+        return self.async_show_form(
+            step_id="configure_features",
+            data_schema=vol.Schema(schema_fields),
             errors=errors,
         )
 
@@ -453,6 +619,7 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         hdo_signal: str,
         price_vt: float,
         price_nt: float,
+        features: Mapping[str, bool] | None = None,
     ) -> FlowResult:
         """Vytvoří config entry."""
         title = self._selected_title.strip() or f"ČEZ {self._selected_ean}".strip() or "ČEZ"
@@ -487,6 +654,7 @@ class CezDistribuceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 CONF_HDO_SIGNAL: hdo_signal,
                 CONF_PRICE_VT: price_vt,
                 CONF_PRICE_NT: price_nt,
+                **(dict(features) if features else {}),
             },
         )
 
@@ -502,19 +670,60 @@ class CezOptionsFlow(config_entries.OptionsFlowWithReload):
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
         entry = self.config_entry
+        errors: dict[str, str] = {}
+        is_production = (
+            entry.data.get(CONF_OM_TYPE) or OM_TYPE_CONSUMPTION
+        ) in OM_TYPES_PRODUCTION
         current_hdo = entry.options.get(
             CONF_HDO_SIGNAL, entry.data.get(CONF_HDO_SIGNAL, "")
         )
+        current_features = {
+            k: _entry_feature_enabled(entry, k, d)
+            for k, d in (
+                _PRODUCTION_FEATURE_DEFAULTS
+                if is_production
+                else _CONSUMPTION_FEATURE_DEFAULTS
+            )
+        }
+
         if user_input is not None:
-            options_data: dict[str, Any] = {
-                CONF_PRICE_VT: user_input[CONF_PRICE_VT],
-                CONF_PRICE_NT: user_input[CONF_PRICE_NT],
+            feature_inputs = _extract_feature_inputs(user_input)
+            resolved_features = {
+                k: bool(feature_inputs.get(k, current_features[k]))
+                for k in current_features
             }
-            if CONF_HDO_SIGNAL in user_input:
-                options_data[CONF_HDO_SIGNAL] = user_input[CONF_HDO_SIGNAL]
-            elif current_hdo:
-                options_data[CONF_HDO_SIGNAL] = current_hdo
-            return self.async_create_entry(data=options_data)
+            if not _has_any_enabled_feature(resolved_features, is_production=is_production):
+                errors["base"] = "no_features_enabled"
+            elif is_production:
+                return self.async_create_entry(data=resolved_features)
+            else:
+                options_data: dict[str, Any] = {
+                    CONF_PRICE_VT: user_input[CONF_PRICE_VT],
+                    CONF_PRICE_NT: user_input[CONF_PRICE_NT],
+                    **resolved_features,
+                }
+                if CONF_HDO_SIGNAL in user_input:
+                    options_data[CONF_HDO_SIGNAL] = user_input[CONF_HDO_SIGNAL]
+                elif current_hdo:
+                    options_data[CONF_HDO_SIGNAL] = current_hdo
+                return self.async_create_entry(data=options_data)
+
+        defaults = user_input or {}
+        schema_fields: dict[Any, Any] = {}
+        signals_overview = ""
+
+        if is_production:
+            schema_fields.update(
+                _build_features_schema_fields(
+                    _PRODUCTION_FEATURE_DEFAULTS, defaults, current_features
+                )
+            )
+            return self.async_show_form(
+                step_id="init",
+                data_schema=vol.Schema(schema_fields),
+                description_placeholders={"signals_overview": ""},
+                errors=errors,
+            )
 
         current_vt = entry.options.get(
             CONF_PRICE_VT, entry.data.get(CONF_PRICE_VT, DEFAULT_PRICE_VT)
@@ -523,41 +732,48 @@ class CezOptionsFlow(config_entries.OptionsFlowWithReload):
             CONF_PRICE_NT, entry.data.get(CONF_PRICE_NT, DEFAULT_PRICE_NT)
         )
 
-        available_signals: list[str] = []
         coordinator = (self.hass.data.get(DOMAIN) or {}).get(entry.entry_id)
         signals_data = (
             (coordinator.data or {}).get(DATA_SIGNALS)
             if coordinator is not None
             else None
         )
-        if isinstance(signals_data, dict):
-            seen: set[str] = set()
-            for item in signals_data.get("signals") or []:
-                if not isinstance(item, dict):
-                    continue
-                code = str(item.get("signal") or "").strip()
-                if code and code not in seen:
-                    seen.add(code)
-                    available_signals.append(code)
-        if current_hdo and current_hdo not in available_signals:
-            available_signals.insert(0, current_hdo)
+        signal_options, raw_overview = build_hdo_signal_options(
+            signals_data,
+            today=dt_util.now().date(),
+            language=_hass_language(self.hass),
+            extra_codes=(current_hdo,) if current_hdo else (),
+        )
+        if raw_overview:
+            signals_overview = f"\n\n{raw_overview}"
 
-        schema_fields: dict[Any, Any] = {}
-        if available_signals:
+        if signal_options:
+            first_signal = next(iter(signal_options))
             schema_fields[
                 vol.Required(
                     CONF_HDO_SIGNAL,
-                    default=current_hdo or available_signals[0],
+                    default=defaults.get(CONF_HDO_SIGNAL, current_hdo or first_signal),
                 )
-            ] = vol.In({s: s for s in available_signals})
+            ] = vol.In(signal_options)
         schema_fields[
-            vol.Required(CONF_PRICE_VT, default=float(current_vt))
+            vol.Required(
+                CONF_PRICE_VT, default=float(defaults.get(CONF_PRICE_VT, current_vt))
+            )
         ] = vol.All(vol.Coerce(float), vol.Range(min=0))
         schema_fields[
-            vol.Required(CONF_PRICE_NT, default=float(current_nt))
+            vol.Required(
+                CONF_PRICE_NT, default=float(defaults.get(CONF_PRICE_NT, current_nt))
+            )
         ] = vol.All(vol.Coerce(float), vol.Range(min=0))
+        schema_fields.update(
+            _build_features_schema_fields(
+                _CONSUMPTION_FEATURE_DEFAULTS, defaults, current_features
+            )
+        )
 
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(schema_fields),
+            description_placeholders={"signals_overview": signals_overview},
+            errors=errors,
         )

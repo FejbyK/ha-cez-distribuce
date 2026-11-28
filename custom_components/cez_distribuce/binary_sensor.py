@@ -11,7 +11,7 @@ from homeassistant.components.binary_sensor import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -22,6 +22,7 @@ from .const import (
     CONF_OM_TYPE,
     DATA_OUTAGES,
     DATA_SIGNALS,
+    DEVICE_GROUP_HDO,
     DOMAIN,
     HDO_STATE_NT,
     HDO_STATE_UNKNOWN,
@@ -38,6 +39,7 @@ from .sensor import (
     _local_iso,
     _local_now,
     _next_tariff_window_absolute,
+    build_device_info,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -57,9 +59,11 @@ async def async_setup_entry(
     om_type = entry.data.get(CONF_OM_TYPE) or OM_TYPE_CONSUMPTION
     is_production = om_type in OM_TYPES_PRODUCTION
 
-    entities: list[BinarySensorEntity] = [CezOutageSensor(coordinator, entry, ean)]
+    entities: list[BinarySensorEntity] = []
+    if coordinator.enable_outages:
+        entities.append(CezOutageSensor(coordinator, entry, ean))
 
-    if not is_production:
+    if not is_production and coordinator.enable_hdo:
         signals_data = (coordinator.data or {}).get(DATA_SIGNALS)
         is_single_tariff = (
             not hdo_signal
@@ -78,7 +82,24 @@ async def async_setup_entry(
                 ]
             )
 
+    _remove_disabled_binary_sensor_entities(
+        hass, ean, {entity.unique_id for entity in entities if entity.unique_id}
+    )
     async_add_entities(entities)
+
+
+def _remove_disabled_binary_sensor_entities(
+    hass: HomeAssistant, ean: str, active_unique_ids: set[str]
+) -> None:
+    """Odstraní z registru binárních senzorů entity, jejichž funkce uživatel vypnul."""
+    registry = er.async_get(hass)
+    for uid in (f"{ean}_outage", f"{ean}_low_tariff", f"{ean}_high_tariff"):
+        if uid in active_unique_ids:
+            continue
+        entity_id = registry.async_get_entity_id("binary_sensor", DOMAIN, uid)
+        if entity_id:
+            _LOGGER.info("Odstraňuji vypnutou binární entitu %s z registru entit.", entity_id)
+            registry.async_remove(entity_id)
 
 
 class CezOutageSensor(CoordinatorEntity[CezDistribuceCoordinator], BinarySensorEntity):
@@ -98,12 +119,7 @@ class CezOutageSensor(CoordinatorEntity[CezDistribuceCoordinator], BinarySensorE
         self._ean = ean
         self._attr_unique_id = f"{ean}_outage"
         self._attr_name = "Porucha / odstávka"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, ean)},
-            name=entry.title,
-            manufacturer="ČEZ",
-            model="Elektroměr",
-        )
+        self._attr_device_info = build_device_info(entry, ean)
 
     @property
     def is_on(self) -> bool:
@@ -156,12 +172,7 @@ class CezTariffBinarySensor(
             self._attr_name = "Vysoký tarif"
             self._attr_icon = "mdi:flash"
 
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, ean)},
-            name=entry.title,
-            manufacturer="ČEZ",
-            model="Elektroměr",
-        )
+        self._attr_device_info = build_device_info(entry, ean, DEVICE_GROUP_HDO)
 
     async def async_added_to_hass(self) -> None:
         """Po přidání do HA spustí minutový přepočet stavu."""

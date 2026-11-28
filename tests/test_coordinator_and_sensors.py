@@ -905,6 +905,9 @@ class TestCoordinatorAndSensors(unittest.IsolatedAsyncioTestCase):
             status_codes=["01", "03", "05", "07", "09", "11", "17"],
             signals=signals_data,
         )
+        # Startup refresh with defer_initial_pnd_sync=True must NOT touch MEPAS
+        # OR Recorder DB during async_setup_entry (everything runs in background).
+        recorder.executor_jobs = 0
         coordinator = self.cez_coord.CezDistribuceCoordinator(
             hass,
             client,
@@ -919,21 +922,21 @@ class TestCoordinatorAndSensors(unittest.IsolatedAsyncioTestCase):
         )
         data = await coordinator._async_update_data()
         coordinator.data = data
-
-        # Startup refresh must NOT touch MEPAS at all, yet local Recorder sensors are ready immediately
         self.assertEqual(client.pnd_calls, 0)
         self.assertEqual(client.pnd_status_calls, 0)
+        self.assertEqual(recorder.executor_jobs, 0)
+        self.assertIsNone(coordinator.last_pnd_timestamp)
+
+        # Background sync hydrates from Recorder, runs MEPAS once, and NEVER probes unknown assembly codes (01/07/09/11/17)
+        await coordinator.async_sync_pnd_in_background()
+        self.assertEqual(client.pnd_status_calls, 1)
+        self.assertGreater(client.pnd_calls, 0)
+        self.assertEqual(set(client.requested_assembly_codes), {"03"})
         self.assertIsNotNone(coordinator.last_pnd_timestamp)
         self.assertIsNotNone(coordinator.monthly_consumption)
         self.assertAlmostEqual(coordinator.monthly_consumption["total_kwh"], 96.0, places=3)
         self.assertIsNotNone(coordinator.last_day_consumption)
         self.assertAlmostEqual(coordinator.last_day_consumption["total_kwh"], 48.0, places=3)
-
-        # Background sync runs MEPAS once and NEVER probes unknown assembly codes (01/07/09/11/17)
-        await coordinator.async_sync_pnd_in_background()
-        self.assertEqual(client.pnd_status_calls, 1)
-        self.assertGreater(client.pnd_calls, 0)
-        self.assertEqual(set(client.requested_assembly_codes), {"03"})
         self.assertIsNotNone(coordinator._pnd_store._data)
         self.assertIsNotNone(coordinator._pnd_store._data["last_pnd_fetch"])
 
@@ -1320,26 +1323,61 @@ class TestCoordinatorAndSensors(unittest.IsolatedAsyncioTestCase):
         bg_tasks.clear()
         self.assertIn(f"{self.cez_const.DOMAIN}.portal_cache.{ean}", hass.store_backing)
 
-        # 2nd startup (simulated HA restart with warm cache): ZERO network calls during setup!
+        # 2nd startup (simulated HA restart with warm cache):
+        # ZERO network calls AND ZERO Recorder DB queries during async_setup_entry!
+        recorder.executor_jobs = 0
         self.assertTrue(await self.cez_init.async_setup_entry(hass, entry))
         restarted_client = clients[1]
         restarted_coord = hass.data[self.cez_const.DOMAIN][entry.entry_id]
         self.assertEqual(restarted_client.login_calls, 0)
         self.assertEqual(restarted_client.portal_calls, 0)
         self.assertEqual(restarted_client.pnd_calls, 0)
-        # Entities already have valid data from cache + local Recorder!
+        self.assertEqual(recorder.executor_jobs, 0)
+        # Entities already have valid data AND PND snapshots purely from JSON cache!
         self.assertIsNotNone(restarted_coord.data)
         self.assertIn(self.cez_const.DATA_SIGNALS, restarted_coord.data)
         self.assertIsNotNone(restarted_coord.last_successful_update)
+        self.assertIsNotNone(restarted_coord.last_pnd_timestamp)
         self.assertIsNotNone(restarted_coord.monthly_consumption)
         self.assertAlmostEqual(restarted_coord.monthly_consumption["total_kwh"], 96.0, places=3)
+        self.assertIsNotNone(restarted_coord.last_day_consumption)
+        self.assertAlmostEqual(restarted_coord.last_day_consumption["total_kwh"], 48.0, places=3)
+        self.assertIsNotNone(restarted_coord.meter_estimate)
+        self.assertIsNotNone(restarted_coord.meter_estimate["tariffs"]["last_day"]["date"])
+
+        # Verify derived sensor entities serialize attributes cleanly from restored snapshot
+        monthly_sensor = self.cez_sensor.CezMonthlyConsumptionSensor(restarted_coord, entry, ean)
+        self.assertAlmostEqual(monthly_sensor.native_value, 96.0, places=3)
+        self.assertIn("hodinova_data_do", monthly_sensor.extra_state_attributes)
+        last_day_sensor = self.cez_sensor.CezLastDayConsumptionSensor(restarted_coord, entry, ean)
+        self.assertAlmostEqual(last_day_sensor.native_value, 48.0, places=3)
+        self.assertIn("hodinova_data_do", last_day_sensor.extra_state_attributes)
+        est_sensor = self.cez_sensor.CezMeterEstimateSensor(restarted_coord, entry, ean)
+        self.assertIsNotNone(est_sensor.native_value)
+        self.assertIn("posledni_odecet_k", est_sensor.extra_state_attributes)
+        est_vt = self.cez_sensor.CezMeterEstimateTariffSensor(restarted_coord, entry, ean, "VT")
+        self.assertIsNotNone(est_vt.native_value)
+        self.assertIn("posledni_den", est_vt.extra_state_attributes)
         self.assertEqual(len(bg_tasks), 1)
 
         # Background startup completes login + fresh portal refresh (and skips MEPAS via persisted throttle)
         await asyncio.gather(*bg_tasks)
+        bg_tasks.clear()
         self.assertEqual(restarted_client.login_calls, 1)
         self.assertEqual(restarted_client.portal_calls, 3)
         self.assertEqual(restarted_client.pnd_calls, 0)
+
+        # 3rd startup simulating legacy cache without pnd_snapshot:
+        # still 0 DB queries during setup, and background task hydrates PND from Recorder!
+        hass.store_backing[f"{self.cez_const.DOMAIN}.portal_cache.{ean}"].pop("pnd_snapshot", None)
+        recorder.executor_jobs = 0
+        self.assertTrue(await self.cez_init.async_setup_entry(hass, entry))
+        legacy_coord = hass.data[self.cez_const.DOMAIN][entry.entry_id]
+        self.assertEqual(recorder.executor_jobs, 0)
+        self.assertIsNone(legacy_coord.last_pnd_timestamp)
+        await asyncio.gather(*bg_tasks)
+        self.assertIsNotNone(legacy_coord.last_pnd_timestamp)
+        self.assertIsNotNone(legacy_coord.monthly_consumption)
 
     async def test_cached_startup_background_auth_error_triggers_reauth_and_outage_keeps_cache(self) -> None:
         recorder = _FakeRecorder()
@@ -1429,6 +1467,384 @@ class TestCoordinatorAndSensors(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(api_client._ensure_auth_login(), api_client._ensure_auth_login())
         self.assertEqual(lazy_logins, 1)
 
+    async def test_config_flow_hdo_signal_times_and_feature_toggles(self) -> None:
+        self.dt_util._now_override = datetime(2026, 4, 15, 10, 0, tzinfo=PRAGUE)
+        recorder = _FakeRecorder()
+        hass = _FakeHass(recorder)
+
+        signals_data = {
+            "signals": [
+                {"signal": "a3b7dp01", "datum": "15.04.2026", "casy": "00:00-06:00;22:00-24:00"},
+                {"signal": "b2c3dp02", "datum": "15.04.2026", "casy": "00:00-20:00"},
+            ]
+        }
+        fake_client = _FakeApiClient([], signals=signals_data)
+        fake_client.async_close = lambda: asyncio.sleep(0)
+
+        flow = self.cez_flow.CezDistribuceConfigFlow()
+        flow.hass = hass
+        flow._username = "u"
+        flow._password = "p"
+        flow._selected_ean = "859182400100000011"
+        flow._selected_uid = "uid-11"
+        flow._selected_title = "Doma"
+        flow._selected_om_type = "S"
+        flow._client = fake_client
+        flow.async_show_form = lambda **kwargs: {"type": "form", **kwargs}
+        flow.async_create_entry = lambda **kwargs: {"type": "create_entry", **kwargs}
+        flow.async_set_unique_id = lambda _uid: asyncio.sleep(0)
+        flow._abort_if_unique_id_configured = lambda: None
+
+        form = await flow.async_step_select_hdo_signal()
+        self.assertEqual(form["step_id"], "select_hdo_signal")
+        hdo_options = form["data_schema"][self.cez_const.CONF_HDO_SIGNAL]
+        self.assertIn("00:00-06:00, 22:00-24:00", hdo_options["a3b7dp01"])
+        self.assertIn("8 h NT", hdo_options["a3b7dp01"])
+        self.assertIn("20 h NT", hdo_options["b2c3dp02"])
+        self.assertIn("**a3b7dp01**", form["description_placeholders"]["signals_overview"])
+        self.assertIn(self.cez_const.CONF_ENABLE_HDO, form["data_schema"])
+        self.assertIn(self.cez_const.CONF_ENABLE_PND, form["data_schema"])
+
+        # Disabling all features is rejected with no_features_enabled
+        invalid = await flow.async_step_select_hdo_signal(
+            {
+                self.cez_const.CONF_HDO_SIGNAL: "a3b7dp01",
+                self.cez_const.CONF_PRICE_VT: 5.0,
+                self.cez_const.CONF_PRICE_NT: 2.5,
+                self.cez_const.CONF_ENABLE_HDO: False,
+                self.cez_const.CONF_ENABLE_READINGS: False,
+                self.cez_const.CONF_ENABLE_OUTAGES: False,
+                self.cez_const.CONF_ENABLE_PND: False,
+                self.cez_const.CONF_ENABLE_COSTS: False,
+            }
+        )
+        self.assertEqual(invalid["errors"]["base"], "no_features_enabled")
+
+        # Valid submission saves selected features into entry data
+        created = await flow.async_step_select_hdo_signal(
+            {
+                self.cez_const.CONF_HDO_SIGNAL: "b2c3dp02",
+                self.cez_const.CONF_PRICE_VT: 5.5,
+                self.cez_const.CONF_PRICE_NT: 2.2,
+                self.cez_const.CONF_ENABLE_HDO: True,
+                self.cez_const.CONF_ENABLE_READINGS: True,
+                self.cez_const.CONF_ENABLE_OUTAGES: False,
+                self.cez_const.CONF_ENABLE_PND: False,
+                self.cez_const.CONF_ENABLE_COSTS: True,
+            }
+        )
+        self.assertEqual(created["type"], "create_entry")
+        self.assertEqual(created["data"][self.cez_const.CONF_HDO_SIGNAL], "b2c3dp02")
+        self.assertFalse(created["data"][self.cez_const.CONF_ENABLE_OUTAGES])
+        self.assertFalse(created["data"][self.cez_const.CONF_ENABLE_PND])
+        self.assertTrue(created["data"][self.cez_const.CONF_ENABLE_HDO])
+
+        # Production (FVE) OM goes to configure_features with outages + PND only
+        prod_flow = self.cez_flow.CezDistribuceConfigFlow()
+        prod_flow.hass = hass
+        prod_flow._selected_ean = "859182400100000012"
+        prod_flow._selected_title = "FVE"
+        prod_flow._selected_om_type = "V"
+        prod_flow.async_show_form = lambda **kwargs: {"type": "form", **kwargs}
+        prod_form = await prod_flow.async_step_select_hdo_signal()
+        self.assertEqual(prod_form["step_id"], "configure_features")
+        self.assertEqual(
+            set(prod_form["data_schema"].keys()),
+            {self.cez_const.CONF_ENABLE_OUTAGES, self.cez_const.CONF_ENABLE_PND},
+        )
+
+        # OptionsFlow is supported for production too and shows outages + PND
+        prod_entry = _FakeEntry(
+            entry_id="entry-fve",
+            data={self.cez_const.CONF_EAN: "859182400100000012", self.cez_const.CONF_OM_TYPE: "V"},
+        )
+        self.assertTrue(self.cez_flow.CezDistribuceConfigFlow.async_supports_options_flow(prod_entry))
+        opt_flow = self.cez_flow.CezOptionsFlow()
+        opt_flow.hass = hass
+        opt_flow.config_entry = prod_entry
+        opt_flow.async_show_form = lambda **kwargs: {"type": "form", **kwargs}
+        opt_flow.async_create_entry = lambda **kwargs: {"type": "create_entry", **kwargs}
+        opt_form = await opt_flow.async_step_init()
+        self.assertEqual(
+            set(opt_form["data_schema"].keys()),
+            {self.cez_const.CONF_ENABLE_OUTAGES, self.cez_const.CONF_ENABLE_PND},
+        )
+        opt_saved = await opt_flow.async_step_init(
+            {self.cez_const.CONF_ENABLE_OUTAGES: False, self.cez_const.CONF_ENABLE_PND: True}
+        )
+        self.assertFalse(opt_saved["data"][self.cez_const.CONF_ENABLE_OUTAGES])
+        self.assertTrue(opt_saved["data"][self.cez_const.CONF_ENABLE_PND])
+
+    async def test_feature_toggles_skip_api_calls_and_cleanup_disabled_entities(self) -> None:
+        self.dt_util._now_override = datetime(2026, 4, 15, 10, 0, tzinfo=PRAGUE)
+        recorder = _FakeRecorder()
+        hass = _FakeHass(recorder)
+        ean = "859182400100000022"
+
+        calls = {"readings": 0, "signals": 0, "outages": 0}
+
+        class _CountingClient(_FakeApiClient):
+            async def get_readings(self, uid: str):
+                calls["readings"] += 1
+                return await super().get_readings(uid)
+
+            async def get_signals(self, e: str):
+                calls["signals"] += 1
+                return await super().get_signals(e)
+
+            async def get_outages(self, e: str):
+                calls["outages"] += 1
+                return await super().get_outages(e)
+
+        client = _CountingClient(
+            _make_day_15min_values("2026-04-14", kw_value=2.0),
+            readings=[{"datumOdectu": "2026-04-12", "stavVt": "100", "stavNt": "50"}],
+            signals={"signals": [{"signal": "a3b7dp01", "datum": "15.04.2026", "casy": "00:00-06:00"}]},
+            outages=[],
+        )
+        # Only readings + costs enabled; HDO, outages, and PND disabled
+        coordinator = self.cez_coord.CezDistribuceCoordinator(
+            hass,
+            client,
+            ean=ean,
+            uid="uid-22",
+            partner="p-22",
+            anlage="a-22",
+            hdo_signal="a3b7dp01",
+            price_vt=6.2,
+            price_nt=2.4,
+            enable_hdo=False,
+            enable_readings=True,
+            enable_outages=False,
+            enable_pnd=False,
+            enable_costs=True,
+        )
+        coordinator.data = await coordinator._async_update_data()
+        self.assertEqual(calls, {"readings": 1, "signals": 0, "outages": 0})
+        self.assertEqual(client.pnd_calls, 0)
+        self.assertEqual(recorder.executor_jobs, 0)
+        self.assertEqual(coordinator.statistic_ids, {})
+
+        # Simulate entity registry containing previously created entities that are now disabled
+        existing_registry = {
+            ("sensor", self.cez_const.DOMAIN, f"{ean}_hdo_state"): "sensor.cez_hdo_state",
+            ("sensor", self.cez_const.DOMAIN, f"{ean}_monthly_consumption"): "sensor.cez_monthly",
+            ("sensor", self.cez_const.DOMAIN, f"{ean}_reading_vt"): "sensor.cez_reading_vt",
+            ("binary_sensor", self.cez_const.DOMAIN, f"{ean}_outage"): "binary_sensor.cez_outage",
+            ("binary_sensor", self.cez_const.DOMAIN, f"{ean}_low_tariff"): "binary_sensor.cez_nt",
+        }
+        removed_entities: list[str] = []
+        fake_reg = types.SimpleNamespace(
+            async_get_entity_id=lambda platform, domain, uid: existing_registry.get((platform, domain, uid)),
+            async_remove=removed_entities.append,
+        )
+        er_mod = sys.modules["homeassistant.helpers.entity_registry"]
+        orig_er_get = er_mod.async_get
+        er_mod.async_get = lambda _hass: fake_reg
+        self.addCleanup(setattr, er_mod, "async_get", orig_er_get)
+
+        entry = _FakeEntry(
+            entry_id="entry-toggles",
+            data={
+                self.cez_const.CONF_EAN: ean,
+                self.cez_const.CONF_HDO_SIGNAL: "a3b7dp01",
+                self.cez_const.CONF_PRICE_VT: 6.2,
+                self.cez_const.CONF_PRICE_NT: 2.4,
+            },
+        )
+        hass.data[self.cez_const.DOMAIN] = {entry.entry_id: coordinator}
+
+        sensors: list[Any] = []
+        await self.cez_sensor.async_setup_entry(hass, entry, sensors.extend)
+        sensor_uids = {s.unique_id for s in sensors}
+        self.assertEqual(
+            sensor_uids,
+            {
+                f"{ean}_last_successful_update",
+                f"{ean}_reading_vt",
+                f"{ean}_reading_nt",
+                f"{ean}_total_consumption",
+                f"{ean}_current_price",
+            },
+        )
+        price_sensor = next(s for s in sensors if s.unique_id == f"{ean}_current_price")
+        self.assertAlmostEqual(price_sensor.native_value, 6.2, places=2)
+
+        bsensors: list[Any] = []
+        await self.cez_bsensor.async_setup_entry(hass, entry, bsensors.extend)
+        self.assertEqual(bsensors, [])
+        self.assertEqual(
+            set(removed_entities),
+            {
+                "sensor.cez_hdo_state",
+                "sensor.cez_monthly",
+                "binary_sensor.cez_outage",
+                "binary_sensor.cez_nt",
+            },
+        )
+
+    async def test_entities_grouped_into_logical_subdevices_and_empty_cleanup(self) -> None:
+        """Entity jsou rozdělené do logických podzařízení a prázdná podzařízení se uklidí."""
+        ean = "859182400123456799"
+        hass = _FakeHass(_FakeRecorder())
+        signals_payload = {
+            "signals": [
+                {"signal": "a3b7dp01", "den": "20.04.2026", "casy": "00:00-06:00"}
+            ]
+        }
+        client = _FakeApiClient([], signals=signals_payload)
+        coordinator = self.cez_coord.CezDistribuceCoordinator(
+            hass,
+            client,
+            uid="u-sub",
+            ean=ean,
+            hdo_signal="a3b7dp01",
+            price_vt=5.0,
+            price_nt=2.5,
+        )
+        coordinator.data = {
+            self.cez_const.DATA_SIGNALS: signals_payload,
+            self.cez_const.DATA_READINGS: {},
+            self.cez_const.DATA_OUTAGES: [],
+        }
+        entry = _FakeEntry(
+            entry_id="entry-sub",
+            title="Byt Praha",
+            data={
+                self.cez_const.CONF_EAN: ean,
+                self.cez_const.CONF_HDO_SIGNAL: "a3b7dp01",
+                self.cez_const.CONF_PRICE_VT: 5.0,
+                self.cez_const.CONF_PRICE_NT: 2.5,
+            },
+        )
+        hass.data[self.cez_const.DOMAIN] = {entry.entry_id: coordinator}
+
+        sensors: list[Any] = []
+        await self.cez_sensor.async_setup_entry(hass, entry, sensors.extend)
+        bsensors: list[Any] = []
+        await self.cez_bsensor.async_setup_entry(hass, entry, bsensors.extend)
+
+        by_uid = {e.unique_id: e for e in [*sensors, *bsensors]}
+        domain = self.cez_const.DOMAIN
+
+        # Hlavní elektroměr: odečty, odhad, poruchy, diagnostika
+        for uid in (
+            f"{ean}_reading_vt",
+            f"{ean}_total_consumption",
+            f"{ean}_meter_estimate",
+            f"{ean}_outage",
+            f"{ean}_last_successful_update",
+            f"{ean}_consumption_data_until",
+        ):
+            info = by_uid[uid]._attr_device_info
+            self.assertEqual(info["identifiers"], {(domain, ean)})
+            self.assertNotIn("via_device", info)
+
+        # HDO a tarify podzařízení (včetně binárních senzorů NT/VT)
+        for uid in (
+            f"{ean}_hdo_state",
+            f"{ean}_hdo_schedule",
+            f"{ean}_vt_start",
+            f"{ean}_low_tariff",
+            f"{ean}_high_tariff",
+        ):
+            info = by_uid[uid]._attr_device_info
+            self.assertEqual(info["identifiers"], {(domain, f"{ean}_hdo")})
+            self.assertEqual(info["via_device"], (domain, ean))
+            self.assertIn("HDO a tarify", info["name"])
+
+        # Spotřeba (PND) podzařízení
+        for uid in (f"{ean}_monthly_consumption", f"{ean}_last_day_consumption"):
+            info = by_uid[uid]._attr_device_info
+            self.assertEqual(info["identifiers"], {(domain, f"{ean}_consumption")})
+            self.assertEqual(info["via_device"], (domain, ean))
+
+        # Ceny a náklady podzařízení
+        for uid in (f"{ean}_current_price", f"{ean}_monthly_cost"):
+            info = by_uid[uid]._attr_device_info
+            self.assertEqual(info["identifiers"], {(domain, f"{ean}_costs")})
+            self.assertEqual(info["via_device"], (domain, ean))
+
+        # Úklid prázdných podzařízení v __init__._cleanup_empty_subdevices
+        removed_devices: list[str] = []
+        fake_devices = {
+            (domain, f"{ean}_hdo"): types.SimpleNamespace(id="dev-hdo", name="HDO"),
+            (domain, f"{ean}_costs"): types.SimpleNamespace(id="dev-costs", name="Costs"),
+        }
+        fake_dev_reg = types.SimpleNamespace(
+            async_get_device=lambda identifiers: fake_devices.get(next(iter(identifiers))),
+            async_remove_device=lambda dev_id: removed_devices.append(dev_id),
+        )
+        fake_dr = types.SimpleNamespace(async_get=lambda _h: fake_dev_reg)
+        fake_er = types.SimpleNamespace(
+            async_get=lambda _h: object(),
+            async_entries_for_device=lambda _reg, dev_id, include_disabled_entities=True: (
+                ["ent-1"] if dev_id == "dev-hdo" else []
+            ),
+        )
+        orig_dr, orig_er = self.cez_init.dr, self.cez_init.er
+        self.cez_init.dr = fake_dr
+        self.cez_init.er = fake_er
+        try:
+            self.cez_init._cleanup_empty_subdevices(hass, ean)
+        finally:
+            self.cez_init.dr = orig_dr
+            self.cez_init.er = orig_er
+        self.assertEqual(removed_devices, ["dev-costs"])
+
+    async def test_config_flow_nested_features_section_and_translations(self) -> None:
+        """ConfigFlow/OptionsFlow přijímá vnořenou sekci 'features' a překlady mají všechny klíče."""
+        import json
+
+        ean = "859182400123456800"
+        hass = _FakeHass(_FakeRecorder())
+        entry = _FakeEntry(
+            entry_id="entry-sec",
+            title="Dům",
+            data={
+                self.cez_const.CONF_EAN: ean,
+                self.cez_const.CONF_HDO_SIGNAL: "a3b7dp01",
+                self.cez_const.CONF_PRICE_VT: 4.5,
+                self.cez_const.CONF_PRICE_NT: 2.2,
+            },
+        )
+        opt_flow = self.cez_flow.CezOptionsFlow()
+        opt_flow.hass = hass
+        opt_flow.config_entry = entry
+        opt_flow.async_show_form = lambda **kwargs: {"type": "form", **kwargs}
+        opt_flow.async_create_entry = lambda **kwargs: {"type": "create_entry", **kwargs}
+
+        res = await opt_flow.async_step_init(
+            {
+                self.cez_const.CONF_PRICE_VT: 5.1,
+                self.cez_const.CONF_PRICE_NT: 2.3,
+                "features": {
+                    self.cez_const.CONF_ENABLE_HDO: True,
+                    self.cez_const.CONF_ENABLE_READINGS: True,
+                    self.cez_const.CONF_ENABLE_OUTAGES: False,
+                    self.cez_const.CONF_ENABLE_PND: True,
+                    self.cez_const.CONF_ENABLE_COSTS: False,
+                },
+            }
+        )
+        self.assertEqual(res["type"], "create_entry")
+        self.assertFalse(res["data"][self.cez_const.CONF_ENABLE_OUTAGES])
+        self.assertFalse(res["data"][self.cez_const.CONF_ENABLE_COSTS])
+        self.assertTrue(res["data"][self.cez_const.CONF_ENABLE_HDO])
+
+        # Ověření překladů (cs.json, en.json, strings.json) pro sekci features i data_description
+        base = Path(__file__).resolve().parent.parent / "custom_components" / "cez_distribuce"
+        for rel in ("translations/cs.json", "translations/en.json", "strings.json"):
+            payload = json.loads((base / rel).read_text(encoding="utf-8"))
+            for step_obj in (
+                payload["config"]["step"]["select_hdo_signal"],
+                payload["options"]["step"]["init"],
+            ):
+                sec = step_obj["sections"]["features"]
+                for key in ("enable_hdo", "enable_readings", "enable_outages", "enable_pnd", "enable_costs"):
+                    self.assertIn(key, sec["data"], f"{rel} missing {key} in section data")
+                    self.assertIn(key, sec["data_description"], f"{rel} missing {key} in section data_description")
+                    self.assertNotEqual(sec["data"][key], key)
 
 if __name__ == "__main__":
     unittest.main()

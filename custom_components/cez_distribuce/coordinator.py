@@ -37,6 +37,11 @@ from .const import (
     DATA_OUTAGES,
     DATA_READINGS,
     DATA_SIGNALS,
+    DEFAULT_ENABLE_COSTS,
+    DEFAULT_ENABLE_HDO,
+    DEFAULT_ENABLE_OUTAGES,
+    DEFAULT_ENABLE_PND,
+    DEFAULT_ENABLE_READINGS,
     DEFAULT_PRICE_NT,
     DEFAULT_PRICE_VT,
     DOMAIN,
@@ -116,6 +121,90 @@ def _parse_utc_iso(raw: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _parse_local_iso(raw: Any) -> datetime | None:
+    """Bezpečně naparsuje ISO 8601 řetězec na tz-aware lokální datetime HA."""
+    parsed = _parse_utc_iso(raw)
+    return dt_util.as_local(parsed) if parsed is not None else None
+
+
+def _iso_if_temporal(val: Any) -> Any:
+    """Převede datetime/date (včetně podtříd) na ISO řetězec pro JSON Store."""
+    iso = getattr(val, "isoformat", None)
+    return iso() if callable(iso) else val
+
+
+def _serialize_pnd_snapshot(
+    *,
+    last_pnd_timestamp: datetime | None,
+    pnd_total_kwh: float | None,
+    pnd_first_timestamp: datetime | None,
+    monthly_consumption: dict[str, Any] | None,
+    last_day_consumption: dict[str, Any] | None,
+    meter_estimate: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Serializuje vypočtené PND souhrny do čistého JSON slovníku pro cache."""
+    if last_pnd_timestamp is None and monthly_consumption is None and meter_estimate is None:
+        return None
+
+    ser_monthly: dict[str, Any] | None = None
+    if isinstance(monthly_consumption, dict):
+        ser_monthly = dict(monthly_consumption)
+        ser_monthly["month_start"] = _iso_if_temporal(ser_monthly.get("month_start"))
+        ser_monthly["data_until"] = _iso_if_temporal(ser_monthly.get("data_until"))
+
+    ser_last_day: dict[str, Any] | None = None
+    if isinstance(last_day_consumption, dict):
+        ser_last_day = dict(last_day_consumption)
+        ser_last_day["day_start"] = _iso_if_temporal(ser_last_day.get("day_start"))
+        ser_last_day["data_until"] = _iso_if_temporal(ser_last_day.get("data_until"))
+
+    ser_estimate: dict[str, Any] | None = None
+    if isinstance(meter_estimate, dict):
+        ser_estimate = dict(meter_estimate)
+        ser_estimate["base_time"] = _iso_if_temporal(ser_estimate.get("base_time"))
+        ser_estimate["data_until"] = _iso_if_temporal(ser_estimate.get("data_until"))
+        tariffs = ser_estimate.get("tariffs")
+        if isinstance(tariffs, dict):
+            tariffs_copy = dict(tariffs)
+            last_day = tariffs_copy.get("last_day")
+            if isinstance(last_day, dict):
+                last_day_copy = dict(last_day)
+                last_day_copy["date"] = _iso_if_temporal(last_day_copy.get("date"))
+                tariffs_copy["last_day"] = last_day_copy
+            ser_estimate["tariffs"] = tariffs_copy
+
+    return {
+        "last_pnd_timestamp": _iso_if_temporal(last_pnd_timestamp),
+        "pnd_total_kwh": pnd_total_kwh,
+        "pnd_first_timestamp": _iso_if_temporal(pnd_first_timestamp),
+        "monthly_consumption": ser_monthly,
+        "last_day_consumption": ser_last_day,
+        "meter_estimate": ser_estimate,
+    }
+
+
+def _deserialize_dict_dates(
+    raw: Any,
+    *,
+    local_dt_keys: tuple[str, ...] = (),
+    utc_dt_keys: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
+    """Obnoví datetime pole v uloženém souhrnu z cache (vrací None při neplatných datech)."""
+    if not isinstance(raw, dict):
+        return None
+    result = dict(raw)
+    for key in local_dt_keys:
+        parsed = _parse_local_iso(result.get(key))
+        if parsed is None:
+            return None
+        result[key] = parsed
+    for key in utc_dt_keys:
+        parsed = _parse_utc_iso(result.get(key))
+        if parsed is None:
+            return None
+        result[key] = parsed
+    return result
+
 
 class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Koordinátor dat ČEZ Distribuce."""
@@ -134,11 +223,21 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         price_nt: float = DEFAULT_PRICE_NT,
         on_uid_changed: Callable[[str], None] | None = None,
         defer_initial_pnd_sync: bool = False,
+        enable_hdo: bool = DEFAULT_ENABLE_HDO,
+        enable_readings: bool = DEFAULT_ENABLE_READINGS,
+        enable_outages: bool = DEFAULT_ENABLE_OUTAGES,
+        enable_pnd: bool = DEFAULT_ENABLE_PND,
+        enable_costs: bool = DEFAULT_ENABLE_COSTS,
     ) -> None:
         self._client = client
         self._hdo_signal = hdo_signal or ""
         self._price_vt = float(price_vt)
         self._price_nt = float(price_nt)
+        self._enable_hdo = bool(enable_hdo)
+        self._enable_readings = bool(enable_readings)
+        self._enable_outages = bool(enable_outages)
+        self._enable_pnd = bool(enable_pnd)
+        self._enable_costs = bool(enable_costs)
         # Plány HDO po dnech {'YYYY-MM-DD': casy} (issue #49) - načtou se
         # líně při první aktualizaci, viz _async_update_hdo_history.
         self._hdo_store: Store[dict[str, Any]] = Store(
@@ -152,6 +251,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass, PORTAL_CACHE_STORAGE_VERSION, f"{DOMAIN}.portal_cache.{ean}"
         )
         self._pnd_state_loaded = False
+        self.cache_miss_reason: str | None = None
         self._defer_initial_pnd_sync = defer_initial_pnd_sync
         self._pnd_lock = asyncio.Lock()
         # Uloží nově dohledané UID do config entry (issue #43) - viz
@@ -252,6 +352,38 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Aktuálně používané UID odběrného místa (může se změnit, issue #43)."""
         return self._uid
 
+    @property
+    def enable_hdo(self) -> bool:
+        """True, pokud je zapnuto sledování HDO a tarifů."""
+        return self._enable_hdo
+
+    @property
+    def enable_readings(self) -> bool:
+        """True, pokud je zapnuto stahování odečtů elektroměru."""
+        return self._enable_readings
+
+    @property
+    def enable_outages(self) -> bool:
+        """True, pokud je zapnuto sledování poruch a odstávek."""
+        return self._enable_outages
+
+    @property
+    def enable_pnd(self) -> bool:
+        """True, pokud je zapnut import hodinových dat (MEPAS/PND)."""
+        return self._enable_pnd
+
+    @property
+    def enable_costs(self) -> bool:
+        """True, pokud jsou zapnuty ceny a nákladové senzory/statistiky."""
+        return self._enable_costs
+
+    @property
+    def needs_portal_fetch(self) -> bool:
+        """True, pokud je zapnutá alespoň jedna funkce využívající DIP portál."""
+        if self._is_production:
+            return self._enable_outages
+        return self._enable_readings or self._enable_hdo or self._enable_outages
+
     def set_partner_and_anlage(self, partner: str, anlage: str) -> None:
         """Aktualizuje metadata potřebná pro hodinová data."""
         self._partner = partner
@@ -310,26 +442,32 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # hodnoty do kWh shodné se spotřebním EAN), takže by šlo
             # jen o zbytečné volání API a zavádějící entity; HDO
             # signály výrobní OM nemá vůbec.
-            fetch_tasks.append(_load_dataset(DATA_READINGS, self._async_fetch_readings))
-            fetch_tasks.append(_load_dataset(DATA_SIGNALS, lambda: self._client.get_signals(self._ean)))
-        fetch_tasks.append(_load_dataset(DATA_OUTAGES, lambda: self._client.get_outages(self._ean)))
+            if self._enable_readings:
+                fetch_tasks.append(_load_dataset(DATA_READINGS, self._async_fetch_readings))
+            if self._enable_hdo:
+                fetch_tasks.append(
+                    _load_dataset(DATA_SIGNALS, lambda: self._client.get_signals(self._ean))
+                )
+        if self._enable_outages:
+            fetch_tasks.append(_load_dataset(DATA_OUTAGES, lambda: self._client.get_outages(self._ean)))
 
-        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-        auth_error = next((r for r in results if isinstance(r, ConfigEntryAuthFailed)), None)
-        if auth_error is not None:
-            raise auth_error
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
+        if fetch_tasks:
+            results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
+            auth_error = next((r for r in results if isinstance(r, ConfigEntryAuthFailed)), None)
+            if auth_error is not None:
+                raise auth_error
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
 
-        if not merged_data:
-            raise UpdateFailed("ČEZ nevrátil žádná data.")
+            if not merged_data:
+                raise UpdateFailed("ČEZ nevrátil žádná data.")
 
         if all_fresh:
             self.last_successful_update = dt_util.utcnow()
         self._schedule_save_portal_cache(merged_data)
 
-        if not self._is_production:
+        if not self._is_production and self._enable_hdo:
             try:
                 await self._async_update_hdo_history(merged_data.get(DATA_SIGNALS))
             except Exception:  # noqa: BLE001
@@ -344,16 +482,15 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # kdyby MEPAS přihlášení zrovna selhalo). Tahle část je nezávislá
         # na 'all_fresh' výše - last_successful_update sleduje portálová
         # data, last_pnd_timestamp jen čerstvost hodinové spotřeby.
-        if self._partner and self._anlage:
+        if self._enable_pnd and self._partner and self._anlage:
             if self._defer_initial_pnd_sync:
                 # Při startu HA neblokujeme setup síťovým MEPAS přihlášením ani
-                # stahováním pnd/data - jen rychle naplníme senzory z lokální
-                # databáze Recorderu a čerstvá data dotáhneme úlohou na pozadí.
+                # dotazy do Recorderu - vše dotáhne úloha na pozadí hned po
+                # vytvoření platforem.
                 self._defer_initial_pnd_sync = False
-                await self._async_hydrate_pnd_from_recorder(merged_data)
             else:
                 await self._async_run_pnd_sync(merged_data)
-        else:
+        elif self._enable_pnd:
             _LOGGER.debug(
                 "Přeskakuji import hodinové spotřeby - chybí 'partner'/'anlage' "
                 "v config entry (stará instalace před touto funkcí, nebo "
@@ -362,55 +499,131 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return merged_data
 
+    def _build_portal_cache_payload(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Sestaví JSON payload lokální cache včetně vypočtených PND souhrnů."""
+        return {
+            "om_type": self._om_type,
+            "last_successful_update": (
+                self.last_successful_update.isoformat()
+                if self.last_successful_update
+                else None
+            ),
+            "data": dict(data),
+            "pnd_snapshot": _serialize_pnd_snapshot(
+                last_pnd_timestamp=self.last_pnd_timestamp,
+                pnd_total_kwh=self.pnd_total_kwh,
+                pnd_first_timestamp=self.pnd_first_timestamp,
+                monthly_consumption=self.monthly_consumption,
+                last_day_consumption=self.last_day_consumption,
+                meter_estimate=self.meter_estimate,
+            ),
+        }
+
     def _schedule_save_portal_cache(self, data: dict[str, Any]) -> None:
         """Odloženě uloží poslední portálová data pro rychlý start po restartu HA."""
         snapshot = dict(data)
-        last_ok = (
-            self.last_successful_update.isoformat()
-            if self.last_successful_update
-            else None
-        )
-        om_type = self._om_type
         self._portal_cache_store.async_delay_save(
-            lambda: {
-                "om_type": om_type,
-                "last_successful_update": last_ok,
-                "data": snapshot,
-            },
+            lambda: self._build_portal_cache_payload(snapshot),
             5,
         )
 
-    async def async_hydrate_from_cache(self) -> bool:
-        """Načte uložená portálová data a lokální statistiky pro okamžitý start.
+    async def async_save_portal_cache_now(self, data: dict[str, Any] | None = None) -> None:
+        """Okamžitě zapíše cache portálových dat na disk (pro jistotu i při rychlém restartu)."""
+        target = data if data is not None else self.data
+        if not isinstance(target, dict) or (not target and self.needs_portal_fetch):
+            return
+        try:
+            await self._portal_cache_store.async_save(self._build_portal_cache_payload(target))
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Okamžité uložení cache portálových dat selhalo (%s).", err)
 
-        Vrací True, pokud byla nalezena použitelná cache a start může proběhnout
-        bez čekání na síť (přihlášení a čerstvý refresh pak doběhnou na pozadí).
+    def _restore_pnd_snapshot(self, snapshot: Any) -> bool:
+        """Obnoví PND souhrny čistě z JSON cache bez jakéhokoliv dotazu do Recorderu."""
+        if not isinstance(snapshot, dict):
+            return False
+        last_ts = _parse_utc_iso(snapshot.get("last_pnd_timestamp"))
+        if last_ts is not None:
+            self.last_pnd_timestamp = last_ts
+        raw_total = snapshot.get("pnd_total_kwh")
+        if isinstance(raw_total, (int, float)):
+            self.pnd_total_kwh = float(raw_total)
+        first_ts = _parse_utc_iso(snapshot.get("pnd_first_timestamp"))
+        if first_ts is not None:
+            self.pnd_first_timestamp = first_ts
+
+        self.monthly_consumption = _deserialize_dict_dates(
+            snapshot.get("monthly_consumption"),
+            local_dt_keys=("month_start",),
+            utc_dt_keys=("data_until",),
+        )
+        self.last_day_consumption = _deserialize_dict_dates(
+            snapshot.get("last_day_consumption"),
+            local_dt_keys=("day_start",),
+            utc_dt_keys=("data_until",),
+        )
+        estimate = _deserialize_dict_dates(
+            snapshot.get("meter_estimate"),
+            utc_dt_keys=("base_time", "data_until"),
+        )
+        if estimate is not None and isinstance(estimate.get("tariffs"), dict):
+            tariffs = dict(estimate["tariffs"])
+            last_day = tariffs.get("last_day")
+            if isinstance(last_day, dict) and isinstance(last_day.get("date"), str):
+                try:
+                    last_day_copy = dict(last_day)
+                    last_day_copy["date"] = date.fromisoformat(last_day_copy["date"])
+                    tariffs["last_day"] = last_day_copy
+                except ValueError:
+                    tariffs["last_day"] = None
+            estimate["tariffs"] = tariffs
+        self.meter_estimate = estimate
+        return last_ts is not None
+
+    async def async_hydrate_from_cache(self) -> bool:
+        """Načte uložená portálová data a PND souhrny čistě z JSON Store.
+
+        Během startu integrace NEVOLÁ síť ani Recorder DB (Recorder bývá při
+        bootu HA vytížený a blokuje start o mnoho sekund). Pokud PND snapshot
+        v cache ještě chybí, doplní se z Recorderu v úloze na pozadí.
         """
+        self.cache_miss_reason = None
         try:
             stored = await self._portal_cache_store.async_load()
         except Exception as err:  # noqa: BLE001
             _LOGGER.debug("Načtení cache portálových dat selhalo (%s).", err)
+            self.cache_miss_reason = f"chyba načtení: {err}"
             return False
         if not isinstance(stored, dict):
+            self.cache_miss_reason = "není uložená"
             return False
         if stored.get("om_type") != self._om_type:
+            self.cache_miss_reason = f"jiný om_type ({stored.get('om_type')} != {self._om_type})"
             return False
         cached_data = stored.get("data")
-        if not isinstance(cached_data, dict) or not cached_data:
+        if not isinstance(cached_data, dict) or (not cached_data and self.needs_portal_fetch):
+            self.cache_miss_reason = "prázdná data"
             return False
-        if not self._is_production and DATA_SIGNALS not in cached_data:
+        if not self._is_production and self._enable_hdo and DATA_SIGNALS not in cached_data:
+            self.cache_miss_reason = "chybí HDO signály"
+            return False
+        if not self._is_production and self._enable_readings and DATA_READINGS not in cached_data:
+            self.cache_miss_reason = "chybí odečty"
+            return False
+        if self._enable_outages and DATA_OUTAGES not in cached_data:
+            self.cache_miss_reason = "chybí odstávky"
             return False
 
         self.data = dict(cached_data)
         self.last_successful_update = _parse_utc_iso(stored.get("last_successful_update"))
         self._defer_initial_pnd_sync = False
-        if not self._is_production:
+        if not self._is_production and self._enable_hdo:
             try:
                 await self._async_update_hdo_history(self.data.get(DATA_SIGNALS))
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("Načtení historie HDO při startu z cache selhalo (%s).", err)
-        if self._partner and self._anlage:
-            await self._async_hydrate_pnd_from_recorder(self.data)
+        if self._enable_pnd and self._partner and self._anlage:
+            await self._async_load_pnd_state()
+            self._restore_pnd_snapshot(stored.get("pnd_snapshot"))
         return True
 
     async def _async_load_pnd_state(self) -> None:
@@ -482,14 +695,17 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_refresh_pnd_derived_sensors(self, data: dict[str, Any]) -> None:
         """Přepočítá odhad stavu elektroměru a měsíční/denní souhrny z Recorderu."""
-        try:
-            await self._async_update_meter_estimate(data.get(DATA_READINGS))
-        except Exception:  # noqa: BLE001
+        if self._enable_readings:
+            try:
+                await self._async_update_meter_estimate(data.get(DATA_READINGS))
+            except Exception:  # noqa: BLE001
+                self.meter_estimate = None
+                _LOGGER.exception(
+                    "Výpočet odhadovaného stavu elektroměru selhal "
+                    "(ostatní senzory tím nejsou dotčeny, issue #40)."
+                )
+        else:
             self.meter_estimate = None
-            _LOGGER.exception(
-                "Výpočet odhadovaného stavu elektroměru selhal "
-                "(ostatní senzory tím nejsou dotčeny, issue #40)."
-            )
         try:
             await self._async_update_monthly_consumption(data.get(DATA_SIGNALS))
         except Exception:  # noqa: BLE001
@@ -519,19 +735,32 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not self._is_production:
                 if not (skip_derived_if_unchanged and not updated and self.monthly_consumption is not None):
                     await self._async_refresh_pnd_derived_sensors(data)
+        if data or not self.needs_portal_fetch:
+            self._schedule_save_portal_cache(data)
         return updated
 
     async def async_sync_pnd_in_background(self) -> None:
         """Provede úvodní synchronizaci MEPAS/PND na pozadí po startu integrace."""
-        if not (self._partner and self._anlage):
+        if not (self._enable_pnd and self._partner and self._anlage):
             return
         try:
+            data = dict(self.data or {})
+            # Pokud po studeném startu ještě nejsou naplněné odvozené senzory,
+            # rychle je naplníme z lokálního Recorderu ještě před síťovým MEPAS.
+            if data:
+                await self.async_save_portal_cache_now(data)
+            if self.last_pnd_timestamp is None:
+                await self._async_hydrate_pnd_from_recorder(data)
+                if self.last_pnd_timestamp is not None and self.data is not None:
+                    self.async_set_updated_data(self.data)
+
             status_before = self.pnd_status_info
             updated = await self._async_run_pnd_sync(
-                dict(self.data or {}), skip_derived_if_unchanged=True
+                data, skip_derived_if_unchanged=True
             )
             if (updated or self.pnd_status_info is not status_before) and self.data is not None:
                 self.async_set_updated_data(self.data)
+            await self.async_save_portal_cache_now(data)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
@@ -619,16 +848,21 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @property
     def statistic_ids(self) -> dict[str, str]:
         """Mapa všech externích statistik vytvářených pro toto odběrné místo."""
+        if not self._enable_pnd:
+            return {}
         if self._is_production:
             return {STATISTIC_PRODUCTION: self.statistic_id_for(STATISTIC_PRODUCTION)}
-        return {
+        result: dict[str, str] = {
             STATISTIC_CONSUMPTION: self.statistic_id_for(STATISTIC_CONSUMPTION),
-            STATISTIC_CONSUMPTION_VT: self.statistic_id_for(STATISTIC_CONSUMPTION_VT),
-            STATISTIC_CONSUMPTION_NT: self.statistic_id_for(STATISTIC_CONSUMPTION_NT),
-            STATISTIC_COST_VT: self.statistic_id_for(STATISTIC_COST_VT),
-            STATISTIC_COST_NT: self.statistic_id_for(STATISTIC_COST_NT),
-            STATISTIC_COST_TOTAL: self.statistic_id_for(STATISTIC_COST_TOTAL),
         }
+        if self._enable_hdo or self._enable_costs:
+            result[STATISTIC_CONSUMPTION_VT] = self.statistic_id_for(STATISTIC_CONSUMPTION_VT)
+            result[STATISTIC_CONSUMPTION_NT] = self.statistic_id_for(STATISTIC_CONSUMPTION_NT)
+        if self._enable_costs:
+            result[STATISTIC_COST_VT] = self.statistic_id_for(STATISTIC_COST_VT)
+            result[STATISTIC_COST_NT] = self.statistic_id_for(STATISTIC_COST_NT)
+            result[STATISTIC_COST_TOTAL] = self.statistic_id_for(STATISTIC_COST_TOTAL)
+        return result
 
     def _statistic_id(self) -> str:
         suffix = STATISTIC_PRODUCTION if self._is_production else STATISTIC_CONSUMPTION
@@ -929,6 +1163,8 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         force_fetch_start: datetime | None = None,
         force_write: bool = False,
     ) -> bool:
+        if not self._enable_pnd:
+            return False
         self._latest_pnd_batch = {}
         await self._async_load_pnd_state()
         statistic_id = self._statistic_id()
@@ -937,14 +1173,23 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Zjistíme, zda máme k dispozici plán HDO (nebo jde o jednotarifní OM
         # bez HDO) a zda už v databázi existují tarifní a nákladové statistiky.
-        lookup = ScheduleLookup(self._hdo_history or {})
+        lookup = ScheduleLookup(self._hdo_history or {}) if self._enable_hdo else ScheduleLookup({})
         is_single_tariff = (
             not self._is_production
-            and not self._hdo_signal
-            and isinstance(signals_data, dict)
-            and not (signals_data.get("signals") or [])
+            and (
+                not self._enable_hdo
+                or (
+                    not self._hdo_signal
+                    and isinstance(signals_data, dict)
+                    and not (signals_data.get("signals") or [])
+                )
+            )
         )
-        can_split_tariffs = (not self._is_production) and (bool(lookup) or is_single_tariff)
+        can_split_tariffs = (
+            (not self._is_production)
+            and (self._enable_hdo or self._enable_costs)
+            and (bool(lookup) or is_single_tariff)
+        )
         fallback_all_vt = (not lookup) and is_single_tariff
 
         vt_stat_id = self.statistic_id_for(STATISTIC_CONSUMPTION_VT)
@@ -953,33 +1198,22 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         cost_nt_stat_id = self.statistic_id_for(STATISTIC_COST_NT)
         cost_total_stat_id = self.statistic_id_for(STATISTIC_COST_TOTAL)
 
-        stat_ids_to_check: tuple[str, ...] = (
-            (statistic_id,)
-            if self._is_production
-            else (
-                statistic_id,
-                vt_stat_id,
-                nt_stat_id,
-                cost_vt_stat_id,
-                cost_nt_stat_id,
-                cost_total_stat_id,
-            )
-        )
+        stat_ids_list: list[str] = [statistic_id]
+        if not self._is_production:
+            if self._enable_hdo or self._enable_costs:
+                stat_ids_list.extend((vt_stat_id, nt_stat_id))
+            if self._enable_costs:
+                stat_ids_list.extend((cost_vt_stat_id, cost_nt_stat_id, cost_total_stat_id))
+        stat_ids_to_check = tuple(stat_ids_list)
         last_stats = await self._async_get_last_statistics_batch(
             recorder, stat_ids_to_check, {"start", "sum"}
         )
         has_existing_data = bool(last_stats.get(statistic_id))
         has_vt_stats = bool(last_stats.get(vt_stat_id)) if not self._is_production else False
         has_nt_stats = bool(last_stats.get(nt_stat_id)) if not self._is_production else False
-        has_cost_vt_stats = (
-            bool(last_stats.get(cost_vt_stat_id)) if not self._is_production else False
-        )
-        has_cost_nt_stats = (
-            bool(last_stats.get(cost_nt_stat_id)) if not self._is_production else False
-        )
-        has_cost_total_stats = (
-            bool(last_stats.get(cost_total_stat_id)) if not self._is_production else False
-        )
+        has_cost_vt_stats = bool(last_stats.get(cost_vt_stat_id)) if (not self._is_production and self._enable_costs) else False
+        has_cost_nt_stats = bool(last_stats.get(cost_nt_stat_id)) if (not self._is_production and self._enable_costs) else False
+        has_cost_total_stats = bool(last_stats.get(cost_total_stat_id)) if (not self._is_production and self._enable_costs) else False
         has_all_cost_stats = (
             has_cost_vt_stats and has_cost_nt_stats and has_cost_total_stats
         )
@@ -989,7 +1223,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         needs_tariff_backfill = can_split_tariffs and (not has_vt_stats or not has_nt_stats)
-        needs_cost_backfill = can_split_tariffs and not has_all_cost_stats
+        needs_cost_backfill = self._enable_costs and can_split_tariffs and not has_all_cost_stats
         if has_existing_data:
             row = last_stats[statistic_id][0]
             # 'start' z get_last_statistics je epoch sekundy (float).
@@ -1364,6 +1598,9 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._latest_pnd_batch[STATISTIC_CONSUMPTION_VT] = dict(hourly_vt)
         self._latest_pnd_batch[STATISTIC_CONSUMPTION_NT] = dict(hourly_nt)
 
+        if not self._enable_costs:
+            return True
+
         # Nákladové statistiky VT / NT / celkem podle cen z konfigurace.
         cost_source_vt = dict(hourly_vt)
         cost_source_nt = dict(hourly_nt)
@@ -1447,7 +1684,7 @@ class CezDistribuceCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         Volá se ze služby `cez_distribuce.recalculate_statistics` (např. po opravě zadaných
         cen elektřiny nebo změně HDO signálu v možnostech integrace).
         """
-        if self._is_production:
+        if self._is_production or not self._enable_pnd:
             _LOGGER.info(
                 "Přepočet tarifů/nákladů se pro výrobní EAN %s přeskočí.",
                 self._ean,

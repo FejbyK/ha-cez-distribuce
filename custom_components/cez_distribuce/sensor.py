@@ -28,6 +28,9 @@ from .const import (
     CONF_PRICE_VT,
     DATA_READINGS,
     DATA_SIGNALS,
+    DEVICE_GROUP_CONSUMPTION,
+    DEVICE_GROUP_COSTS,
+    DEVICE_GROUP_HDO,
     DEFAULT_PRICE_NT,
     DEFAULT_PRICE_VT,
     DOMAIN,
@@ -98,8 +101,11 @@ async def async_setup_entry(
 
     entities: list[SensorEntity] = [
         CezLastSuccessfulUpdateSensor(coordinator, entry, ean),
-        CezConsumptionFreshnessSensor(coordinator, entry, ean, is_production),
     ]
+    if coordinator.enable_pnd:
+        entities.append(
+            CezConsumptionFreshnessSensor(coordinator, entry, ean, is_production)
+        )
 
     if is_production:
         # Výroba/mikrozdroj (FVE) - dodávka aktivní energie DO sítě. HDO
@@ -113,21 +119,27 @@ async def async_setup_entry(
         # "Celkovou dodávku do sítě"), proto se tu po nich uklidí registr
         # entit, aby nezůstaly viset jako "nedostupné".
         _remove_stale_production_reading_entities(hass, ean)
-        entities.append(CezTotalProductionSensor(coordinator, entry, ean))
+        if coordinator.enable_pnd:
+            entities.append(CezTotalProductionSensor(coordinator, entry, ean))
     else:
         signals_data = (coordinator.data or {}).get(DATA_SIGNALS)
         is_single_tariff = (
-            not hdo_signal
-            and isinstance(signals_data, dict)
-            and not (signals_data.get("signals") or [])
+            not coordinator.enable_hdo
+            or (
+                not hdo_signal
+                and isinstance(signals_data, dict)
+                and not (signals_data.get("signals") or [])
+            )
         )
-        entities.extend(
-            [
-                CezReadingSensor(coordinator, entry, ean, "VT"),
-                CezReadingSensor(coordinator, entry, ean, "NT"),
-            ]
-        )
-        if not is_single_tariff:
+        if coordinator.enable_readings:
+            entities.extend(
+                [
+                    CezReadingSensor(coordinator, entry, ean, "VT"),
+                    CezReadingSensor(coordinator, entry, ean, "NT"),
+                    CezTotalConsumptionSensor(coordinator, entry, ean),
+                ]
+            )
+        if coordinator.enable_hdo and not is_single_tariff:
             entities.extend(
                 [
                     CezHdoStateSensor(coordinator, entry, ean, hdo_signal),
@@ -140,26 +152,91 @@ async def async_setup_entry(
                     CezTariffCountdownSensor(coordinator, entry, ean, hdo_signal, HDO_STATE_NT),
                 ]
             )
-        entities.extend(
-            [
-                CezTotalConsumptionSensor(coordinator, entry, ean),
-                CezMonthlyConsumptionSensor(coordinator, entry, ean),
-                CezMonthlyConsumptionSensor(coordinator, entry, ean, HDO_STATE_VT),
-                CezMonthlyConsumptionSensor(coordinator, entry, ean, HDO_STATE_NT),
-                CezMonthlyCostSensor(coordinator, entry, ean),
-                CezMonthlyCostSensor(coordinator, entry, ean, HDO_STATE_VT),
-                CezMonthlyCostSensor(coordinator, entry, ean, HDO_STATE_NT),
-                CezLastDayConsumptionSensor(coordinator, entry, ean),
-                CezLastDayConsumptionSensor(coordinator, entry, ean, HDO_STATE_VT),
-                CezLastDayConsumptionSensor(coordinator, entry, ean, HDO_STATE_NT),
-                CezMeterEstimateSensor(coordinator, entry, ean),
-                CezMeterEstimateTariffSensor(coordinator, entry, ean, HDO_STATE_VT),
-                CezMeterEstimateTariffSensor(coordinator, entry, ean, HDO_STATE_NT),
-                CezCurrentPriceSensor(coordinator, entry, ean, hdo_signal),
-            ]
-        )
+        if coordinator.enable_pnd:
+            entities.append(CezMonthlyConsumptionSensor(coordinator, entry, ean))
+            if coordinator.enable_hdo:
+                entities.extend(
+                    [
+                        CezMonthlyConsumptionSensor(coordinator, entry, ean, HDO_STATE_VT),
+                        CezMonthlyConsumptionSensor(coordinator, entry, ean, HDO_STATE_NT),
+                    ]
+                )
+            if coordinator.enable_costs:
+                entities.append(CezMonthlyCostSensor(coordinator, entry, ean))
+                if coordinator.enable_hdo:
+                    entities.extend(
+                        [
+                            CezMonthlyCostSensor(coordinator, entry, ean, HDO_STATE_VT),
+                            CezMonthlyCostSensor(coordinator, entry, ean, HDO_STATE_NT),
+                        ]
+                    )
+            entities.append(CezLastDayConsumptionSensor(coordinator, entry, ean))
+            if coordinator.enable_hdo:
+                entities.extend(
+                    [
+                        CezLastDayConsumptionSensor(coordinator, entry, ean, HDO_STATE_VT),
+                        CezLastDayConsumptionSensor(coordinator, entry, ean, HDO_STATE_NT),
+                    ]
+                )
+            if coordinator.enable_readings:
+                entities.append(CezMeterEstimateSensor(coordinator, entry, ean))
+                if coordinator.enable_hdo:
+                    entities.extend(
+                        [
+                            CezMeterEstimateTariffSensor(coordinator, entry, ean, HDO_STATE_VT),
+                            CezMeterEstimateTariffSensor(coordinator, entry, ean, HDO_STATE_NT),
+                        ]
+                    )
+        if coordinator.enable_costs:
+            entities.append(CezCurrentPriceSensor(coordinator, entry, ean, hdo_signal))
 
+    _remove_disabled_sensor_entities(
+        hass, ean, {entity.unique_id for entity in entities if entity.unique_id}
+    )
     async_add_entities(entities)
+
+
+def _remove_disabled_sensor_entities(
+    hass: HomeAssistant, ean: str, active_unique_ids: set[str]
+) -> None:
+    """Odstraní z registru senzorů entity, jejichž funkce uživatel vypnul."""
+    managed_unique_ids = (
+        f"{ean}_current_price",
+        f"{ean}_hdo_state",
+        f"{ean}_hdo_schedule",
+        f"{ean}_vt_start",
+        f"{ean}_vt_end",
+        f"{ean}_nt_start",
+        f"{ean}_nt_end",
+        f"{ean}_vt_countdown",
+        f"{ean}_nt_countdown",
+        f"{ean}_reading_vt",
+        f"{ean}_reading_nt",
+        f"{ean}_total_consumption",
+        f"{ean}_meter_estimate",
+        f"{ean}_meter_estimate_vt",
+        f"{ean}_meter_estimate_nt",
+        f"{ean}_monthly_consumption",
+        f"{ean}_monthly_consumption_vt",
+        f"{ean}_monthly_consumption_nt",
+        f"{ean}_monthly_cost",
+        f"{ean}_monthly_cost_vt",
+        f"{ean}_monthly_cost_nt",
+        f"{ean}_last_day_consumption",
+        f"{ean}_last_day_consumption_vt",
+        f"{ean}_last_day_consumption_nt",
+        f"{ean}_total_production",
+        f"{ean}_consumption_data_until",
+        f"{ean}_production_data_until",
+    )
+    registry = er.async_get(hass)
+    for uid in managed_unique_ids:
+        if uid in active_unique_ids:
+            continue
+        entity_id = registry.async_get_entity_id("sensor", DOMAIN, uid)
+        if entity_id:
+            _LOGGER.info("Odstraňuji vypnutou entitu %s z registru entit.", entity_id)
+            registry.async_remove(entity_id)
 
 
 def _remove_stale_production_reading_entities(hass: HomeAssistant, ean: str) -> None:
@@ -204,13 +281,39 @@ class CezTimeAwareSensor(CoordinatorEntity[CezDistribuceCoordinator], SensorEnti
         self.async_write_ha_state()
 
 
-def _device_info(entry: ConfigEntry, ean: str) -> DeviceInfo:
+_SUBDEVICE_METADATA: dict[str, tuple[str, str]] = {
+    DEVICE_GROUP_HDO: ("HDO a tarify", "HDO a tarify"),
+    DEVICE_GROUP_CONSUMPTION: ("Spotřeba", "Spotřeba (PND)"),
+    DEVICE_GROUP_COSTS: ("Ceny a náklady", "Ceny a náklady"),
+}
+
+
+def build_device_info(
+    entry: ConfigEntry, ean: str, group: str | None = None
+) -> DeviceInfo:
+    """Vrátí DeviceInfo pro hlavní elektroměr nebo logické podzařízení.
+
+    Existující `unique_id` entit zůstávají beze změny, takže přechod na
+    podzařízení nemění stávající `entity_id` ani automatizace.
+    """
+    if group and group in _SUBDEVICE_METADATA:
+        suffix_name, model = _SUBDEVICE_METADATA[group]
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{ean}_{group}")},
+            via_device=(DOMAIN, ean),
+            name=f"{entry.title} – {suffix_name}",
+            manufacturer="ČEZ",
+            model=model,
+        )
     return DeviceInfo(
         identifiers={(DOMAIN, ean)},
         name=entry.title,
         manufacturer="ČEZ",
         model="Elektroměr",
     )
+
+
+_device_info = build_device_info
 
 
 class CezCurrentPriceSensor(CezTimeAwareSensor):
@@ -239,9 +342,11 @@ class CezCurrentPriceSensor(CezTimeAwareSensor):
         )
         self._attr_unique_id = f"{ean}_current_price"
         self._attr_name = "Aktuální cena"
-        self._attr_device_info = _device_info(entry, ean)
+        self._attr_device_info = _device_info(entry, ean, DEVICE_GROUP_COSTS)
 
     def _is_single_tariff(self) -> bool:
+        if not self.coordinator.enable_hdo:
+            return True
         if self._hdo_signal:
             return False
         signals_data = (self.coordinator.data or {}).get(DATA_SIGNALS)
@@ -295,7 +400,7 @@ class CezHdoStateSensor(CezTimeAwareSensor):
         self._hdo_signal = hdo_signal
         self._attr_unique_id = f"{ean}_hdo_state"
         self._attr_name = "Stav HDO"
-        self._attr_device_info = _device_info(entry, ean)
+        self._attr_device_info = _device_info(entry, ean, DEVICE_GROUP_HDO)
 
     @property
     def native_value(self) -> str:
@@ -340,7 +445,7 @@ class CezHdoScheduleSensor(CoordinatorEntity[CezDistribuceCoordinator], SensorEn
         self._hdo_signal = hdo_signal
         self._attr_unique_id = f"{ean}_hdo_schedule"
         self._attr_name = "Spínání HDO dnes"
-        self._attr_device_info = _device_info(entry, ean)
+        self._attr_device_info = _device_info(entry, ean, DEVICE_GROUP_HDO)
 
     @property
     def native_value(self) -> int | None:
@@ -389,7 +494,7 @@ class CezTariffBoundarySensor(CoordinatorEntity[CezDistribuceCoordinator], Senso
 
         self._attr_unique_id = f"{ean}_{tariff.lower()}_{suffix}"
         self._attr_name = f"{tariff_name} {boundary_name}"
-        self._attr_device_info = _device_info(entry, ean)
+        self._attr_device_info = _device_info(entry, ean, DEVICE_GROUP_HDO)
 
     @property
     def native_value(self) -> str | None:
@@ -426,7 +531,7 @@ class CezTariffCountdownSensor(CoordinatorEntity[CezDistribuceCoordinator], Sens
 
         self._attr_unique_id = f"{ean}_{tariff.lower()}_countdown"
         self._attr_name = f"Odpočet do konce {label.lower()}"
-        self._attr_device_info = _device_info(entry, ean)
+        self._attr_device_info = _device_info(entry, ean, DEVICE_GROUP_HDO)
 
     @property
     def native_value(self) -> int | None:
@@ -719,7 +824,7 @@ class CezMonthlyConsumptionSensor(CoordinatorEntity[CezDistribuceCoordinator], S
             self._stat_suffix = STATISTIC_CONSUMPTION
             self._attr_unique_id = f"{ean}_monthly_consumption"
             self._attr_name = "Celková měsíční spotřeba"
-        self._attr_device_info = _device_info(entry, ean)
+        self._attr_device_info = _device_info(entry, ean, DEVICE_GROUP_CONSUMPTION)
 
     @property
     def last_reset(self) -> datetime | None:
@@ -809,7 +914,7 @@ class CezMonthlyCostSensor(CoordinatorEntity[CezDistribuceCoordinator], SensorEn
             self._stat_suffix = STATISTIC_COST_TOTAL
             self._attr_unique_id = f"{ean}_monthly_cost"
             self._attr_name = "Celkové měsíční náklady"
-        self._attr_device_info = _device_info(entry, ean)
+        self._attr_device_info = _device_info(entry, ean, DEVICE_GROUP_COSTS)
 
     @property
     def native_unit_of_measurement(self) -> str:
@@ -899,7 +1004,7 @@ class CezLastDayConsumptionSensor(CoordinatorEntity[CezDistribuceCoordinator], S
             self._stat_suffix = STATISTIC_CONSUMPTION
             self._attr_unique_id = f"{ean}_last_day_consumption"
             self._attr_name = "Poslední den spotřeba"
-        self._attr_device_info = _device_info(entry, ean)
+        self._attr_device_info = _device_info(entry, ean, DEVICE_GROUP_CONSUMPTION)
 
     @property
     def last_reset(self) -> datetime | None:

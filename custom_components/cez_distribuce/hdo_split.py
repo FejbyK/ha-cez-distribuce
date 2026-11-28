@@ -342,3 +342,167 @@ def count_schedule_sources(
         len(days_by_source.get(SOURCE_WEEKDAY, ())),
         len(days_by_source.get(SOURCE_NEAREST, ())),
     )
+
+
+def format_minutes_hhmm(minutes: int) -> str:
+    """Minuty dne -> 'HH:MM' (1440 -> '24:00')."""
+    if minutes >= MINUTES_PER_DAY:
+        return "24:00"
+    minutes = max(0, int(minutes))
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
+
+
+def format_nt_duration(minutes: int, language: str = "cs") -> str:
+    """Celkový počet minut NT za den -> čitelný popis ('8 h', '8 h 30 min')."""
+    minutes = max(0, int(minutes))
+    hours, rem = divmod(minutes, 60)
+    if hours and rem:
+        return f"{hours} h {rem} min"
+    if hours:
+        return f"{hours} h"
+    if rem:
+        return f"{rem} min"
+    return "0 h" if language == "cs" else "0 h"
+
+
+def _format_segments(segments: list[tuple[int, int]]) -> str:
+    return ", ".join(
+        f"{format_minutes_hhmm(start)}-{format_minutes_hhmm(end)}"
+        for start, end in segments
+    )
+
+
+def summarize_hdo_signals(
+    signals_data: Any,
+    *,
+    today: date | None = None,
+    language: str = "cs",
+) -> list[dict[str, Any]]:
+    """Sestaví přehled dostupných HDO povelů včetně jejich spínacích časů.
+
+    Slouží pro srozumitelný výběr HDO signálu při přidání integrace i v možnostech
+    nastavení (místo holých kódů typu 'a3b7dp01' zobrazí dnešní časy NT a počet
+    hodin NT denně; u víkendových tarifů bez dnešního NT doplní i první dostupný
+    den s NT).
+    """
+    is_cs = str(language or "cs").lower().startswith("cs")
+    by_code: dict[str, list[tuple[date | None, str]]] = {}
+    order: list[str] = []
+
+    raw_signals = (
+        signals_data.get("signals")
+        if isinstance(signals_data, dict)
+        else None
+    ) or []
+    for item in raw_signals:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("signal") or "").strip()
+        if not code:
+            continue
+        if code not in by_code:
+            by_code[code] = []
+            order.append(code)
+        parsed_day: date | None = None
+        raw_date = item.get("datum")
+        if raw_date:
+            try:
+                parsed_day = datetime.strptime(str(raw_date).strip(), "%d.%m.%Y").date()
+            except ValueError:
+                parsed_day = None
+        casy = str(item.get("casy") or "").strip()
+        by_code[code].append((parsed_day, casy))
+
+    summaries: list[dict[str, Any]] = []
+    for code in order:
+        entries = by_code[code]
+        dated = [(d, c) for d, c in entries if d is not None]
+        ref_day: date | None = None
+        ref_casy = ""
+        if dated:
+            dated.sort(key=lambda pair: pair[0])
+            if today is not None:
+                exact = next((pair for pair in dated if pair[0] == today), None)
+                upcoming = next((pair for pair in dated if pair[0] > today), None)
+                ref_day, ref_casy = exact or upcoming or dated[-1]
+            else:
+                ref_day, ref_casy = dated[0]
+        elif entries:
+            ref_day, ref_casy = entries[0]
+
+        segments = parse_casy_segments(ref_casy)
+        nt_minutes = sum(end - start for start, end in segments)
+        intervals_str = _format_segments(segments)
+        dur_str = format_nt_duration(nt_minutes, language="cs" if is_cs else "en")
+
+        # Víkendový / občasný povel: pokud dnešní den nemá žádné NT, zkusíme najít
+        # jiný vrácený den se spínáním, aby uživatel viděl, kdy povel spíná.
+        alt_day: date | None = None
+        alt_segments: list[tuple[int, int]] = []
+        if not segments and dated:
+            for cand_day, cand_casy in dated:
+                cand_segs = parse_casy_segments(cand_casy)
+                if cand_segs:
+                    alt_day = cand_day
+                    alt_segments = cand_segs
+                    break
+
+        date_prefix = ""
+        if ref_day is not None and today is not None and ref_day != today:
+            date_prefix = f"{ref_day.strftime('%d.%m.')} "
+
+        if intervals_str:
+            label = f"{code} — {date_prefix}{intervals_str} ({dur_str} NT)"
+            md = f"- **{code}** ({date_prefix}{dur_str} NT): `{intervals_str}`"
+        elif alt_day is not None and alt_segments:
+            alt_intervals = _format_segments(alt_segments)
+            alt_dur = format_nt_duration(
+                sum(end - start for start, end in alt_segments),
+                language="cs" if is_cs else "en",
+            )
+            no_nt_today = "dnes bez NT" if is_cs else "no NT today"
+            alt_str = f"{alt_day.strftime('%d.%m.')}: {alt_intervals}, {alt_dur} NT"
+            label = f"{code} — {no_nt_today} ({alt_str})"
+            md = f"- **{code}** ({no_nt_today}; {alt_day.strftime('%d.%m.')} {alt_dur} NT): `{alt_intervals}`"
+        else:
+            no_nt = "bez NT" if is_cs else "no NT"
+            label = f"{code} — {no_nt}"
+            md = f"- **{code}**: {no_nt}"
+
+        summaries.append(
+            {
+                "code": code,
+                "date": ref_day,
+                "intervals": intervals_str,
+                "nt_minutes": nt_minutes,
+                "label": label,
+                "markdown": md,
+            }
+        )
+    return summaries
+
+
+def build_hdo_signal_options(
+    signals_data: Any,
+    *,
+    today: date | None = None,
+    language: str = "cs",
+    extra_codes: Iterable[str] = (),
+) -> tuple[dict[str, str], str]:
+    """Vrátí `(options_dict, markdown_overview)` pro výběr HDO povelu v config/options flow."""
+    summaries = summarize_hdo_signals(signals_data, today=today, language=language)
+    options: dict[str, str] = {}
+    md_lines: list[str] = []
+    for item in summaries:
+        options[item["code"]] = item["label"]
+        md_lines.append(item["markdown"])
+
+    extras: dict[str, str] = {}
+    for raw in extra_codes:
+        code = str(raw or "").strip()
+        if code and code not in options and code not in extras:
+            extras[code] = code
+    if extras:
+        options = {**extras, **options}
+
+    return options, "\n".join(md_lines)
